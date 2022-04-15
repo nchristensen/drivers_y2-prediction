@@ -18,19 +18,56 @@ Else
     boundratiocavity=2.0;
 EndIf
 
+If(Exists(blratioinjector))
+    boundratioinjector=blratioinjector;
+Else
+    boundratioinjector=2.0;
+EndIf
+
+If(Exists(blratiosample))
+    boundratiosample=blratiosample;
+Else
+    boundratiosample=4.0;
+EndIf
+
+If(Exists(blratiosurround))
+    boundratiosurround=blratiosurround;
+Else
+    boundratiosurround=2.0;
+EndIf
+
+If(Exists(injectorfac))
+    injector_factor=injectorfac;
+Else
+    injector_factor=10.0;
+EndIf
+
+// horizontal injection
+cavityAngle=45;
+inj_h=4.e-3;  // height of injector (bottom) from floor
+inj_d=1.59e-3; // diameter of injector
+inj_l = 20e-3; // length of injector
+
 bigsize = basesize*4;     // the biggest mesh size 
 inletsize = basesize*2;   // background mesh size upstream of the nozzle
 isosize = basesize;       // background mesh size in the isolator
 nozzlesize = basesize/2;       // background mesh size in the isolator
 cavitysize = basesize/2.; // background mesh size in the cavity region
+samplesize = basesize/2;       // background mesh size in the sample
+injectorsize = inj_d/injector_factor; // background mesh size in the cavity region
 
 Printf("basesize = %f", basesize);
 Printf("inletsize = %f", inletsize);
 Printf("isosize = %f", isosize);
 Printf("nozzlesize = %f", nozzlesize);
 Printf("cavitysize = %f", cavitysize);
+Printf("injectorsize = %f", injectorsize);
+Printf("samplesize = %f", samplesize);
 Printf("boundratio = %f", boundratio);
 Printf("boundratiocavity = %f", boundratiocavity);
+Printf("boundratioinjector = %f", boundratioinjector);
+Printf("boundratiosample = %f", boundratiosample);
+Printf("boundratiosurround = %f", boundratiosurround);
 
 p = 1;
 l = 1;
@@ -500,6 +537,16 @@ Point(p_cavity_rear_lower) = {x_cavity_rl,y_cavity_l,0.0,basesize};
 Point(p_cavity_rear_upper) = {x_cavity_ru,y_cavity_u,0.0,basesize};
 Point(p_expansion_start) = {x_cavity_ru+0.02,y_cavity_u,0.0,basesize};
 
+// injector
+p_injector_cavity_lower = p++;
+p_injector_cavity_upper = p++;
+p_injector_entrance_lower = p++;
+p_injector_entrance_upper = p++;
+Point(p_injector_cavity_lower) = {x_cavity_rl+inj_h, y_cavity_l+inj_h, 0., basesize};
+Point(p_injector_entrance_lower) = {x_cavity_rl+inj_h+inj_l, y_cavity_l+inj_h, 0., basesize};
+Point(p_injector_entrance_upper) = {x_cavity_rl+inj_h+inj_l, y_cavity_l+inj_h+inj_d, 0., basesize};
+Point(p_injector_cavity_upper) = {x_cavity_rl+inj_h+inj_d, y_cavity_l+inj_h+inj_d, 0., basesize};
+
 //Wall
 p_wall_insert_front_lower = p++;
 p_wall_insert_front_upper = p++;
@@ -511,8 +558,8 @@ Point(p_wall_insert_front_lower) = {x_cavity_ru-0.01,y_cavity_u-0.012,0.0,basesi
 Point(p_wall_insert_front_upper) = {x_cavity_ru-0.01,y_cavity_u-0.01,0.0,basesize};
 Point(p_wall_insert_rear_lower) = {x_cavity_ru+0.01,y_cavity_u-0.012,0.0,basesize};
 Point(p_wall_insert_rear_upper) = {x_cavity_ru+0.01,y_cavity_u,0.0,basesize};
-Point(p_wall_surround_front_lower) = {x_cavity_ru-0.0144,y_cavity_u-0.0144,0.0,basesize};
-Point(p_wall_surround_rear_lower) = {x_cavity_ru+0.02,y_cavity_u-0.0144,0.0,basesize};
+Point(p_wall_surround_front_lower) = {x_cavity_ru-0.014,y_cavity_u-0.014,0.0,basesize};
+Point(p_wall_surround_rear_lower) = {x_cavity_ru+0.02,y_cavity_u-0.014,0.0,basesize};
 
 //Extend downstream a bit
 p_outlet_lower = p++;
@@ -527,6 +574,7 @@ l_cavity_bottom = l++;
 l_cavity_rear_1 = l++;
 l_cavity_rear_2 = l++;
 l_cavity_rear_3 = l++;
+l_cavity_rear_4 = l++;
 l_postcavity_flat_1 = l++;
 l_postcavity_flat_2 = l++;
 l_bottom_expansion = l++;
@@ -536,12 +584,16 @@ l_wall_insert_rear = l++;
 l_wall_surround_bottom = l++;
 l_wall_surround_rear = l++;
 l_bottom_expansion = l++;
+l_injector_bottom = l++;
+l_injector_inlet = l++;
+l_injector_top = l++;
 Line(l_isolator_to_cavity) = {p_nozzle_bottom_end,p_cavity_front_upper};
 Line(l_cavity_front) = {p_cavity_front_upper,p_cavity_front_lower};
 Line(l_cavity_bottom) = {p_cavity_front_lower,p_cavity_rear_lower};
-Line(l_cavity_rear_1) = {p_cavity_rear_lower,p_wall_surround_front_lower};
-Line(l_cavity_rear_2) = {p_wall_surround_front_lower,p_wall_insert_front_upper};
-Line(l_cavity_rear_3) = {p_wall_insert_front_upper,p_cavity_rear_upper};
+Line(l_cavity_rear_1) = {p_cavity_rear_lower,p_injector_cavity_lower};
+Line(l_cavity_rear_2) = {p_injector_cavity_upper,p_wall_surround_front_lower};
+Line(l_cavity_rear_3) = {p_wall_surround_front_lower,p_wall_insert_front_upper};
+Line(l_cavity_rear_4) = {p_wall_insert_front_upper,p_cavity_rear_upper};
 Line(l_postcavity_flat_1) = {p_cavity_rear_upper,p_wall_insert_rear_upper};
 Line(l_postcavity_flat_2) = {p_wall_insert_rear_upper,p_expansion_start};
 Line(l_bottom_expansion) = {p_expansion_start,p_outlet_lower};
@@ -550,6 +602,10 @@ Line(l_wall_insert_bottom) = {p_wall_insert_front_lower,p_wall_insert_rear_lower
 Line(l_wall_insert_rear) = {p_wall_insert_rear_lower,p_wall_insert_rear_upper};
 Line(l_wall_surround_bottom) = {p_wall_surround_front_lower,p_wall_surround_rear_lower};
 Line(l_wall_surround_rear) = {p_wall_surround_rear_lower,p_expansion_start};
+
+Line(l_injector_bottom) = {p_injector_cavity_lower,p_injector_entrance_lower};
+Line(l_injector_inlet) = {p_injector_entrance_lower, p_injector_entrance_upper};
+Line(l_injector_top) = {p_injector_entrance_upper, p_injector_cavity_upper};
 
 //Outlet
 l_outlet = l++;
@@ -569,8 +625,12 @@ l_nozzle_top,
 -l_bottom_expansion,
 -l_postcavity_flat_2,
 -l_postcavity_flat_1,
+-l_cavity_rear_4,
 -l_cavity_rear_3,
 -l_cavity_rear_2,
+-l_injector_top,
+-l_injector_inlet,
+-l_injector_bottom,
 -l_cavity_rear_1,
 -l_cavity_bottom,
 -l_cavity_front,
@@ -583,14 +643,14 @@ l_nozzle_top,
 // Insert
 Curve Loop(2) = {
 -l_wall_insert_front,
-l_cavity_rear_3,
+l_cavity_rear_4,
 l_postcavity_flat_1,
 -l_wall_insert_rear,
 -l_wall_insert_bottom
 };
 // Surround
 Curve Loop(3) = {
-l_cavity_rear_2,
+l_cavity_rear_3,
 l_wall_insert_front,
 l_wall_insert_bottom,
 l_wall_insert_rear,
@@ -605,23 +665,27 @@ Plane Surface(3) = {3};
 
 Physical Surface('fluid') = {-1};
 Physical Surface('wall_insert') = {-2};
-Physical Surface('wall_surround') = {-3};
+Physical Surface('wall_surround') = {3};
 
 Physical Curve('inflow') = {-l_inlet};
 Physical Curve('outflow') = {l_outlet};
-Physical Curve('wall_isothermal') = {
+Physical Curve('injection') = {l_injector_inlet};
+Physical Curve('isothermal_wall') = {
 l_nozzle_top,
 l_nozzle_bottom,
 l_isolator_to_cavity,
 l_cavity_front,
 l_cavity_bottom,
 l_cavity_rear_1,
+l_cavity_rear_2,
+l_injector_bottom,
+l_injector_top,
 l_bottom_expansion,
 l_postnozzle_top
 };
 Physical Curve('fluid_wall_interface') = {
-l_cavity_rear_2,
 l_cavity_rear_3,
+l_cavity_rear_4,
 l_postcavity_flat_1,
 l_postcavity_flat_2
 };
@@ -636,7 +700,6 @@ Field[1].CurvesList = {
   l_nozzle_top,
   l_nozzle_bottom,
   l_isolator_to_cavity,
-  l_postcavity_flat_1,
   l_postcavity_flat_2,
   l_bottom_expansion,
   l_postnozzle_top
@@ -658,15 +721,14 @@ Field[11].CurvesList = {
   l_cavity_front,
   l_cavity_bottom,
   l_cavity_rear_1,
-  l_cavity_rear_2,
-  l_cavity_rear_3
+  l_cavity_rear_2
 };
 Field[11].NumPointsPerCurve = 100000;
 
 //Create threshold field that varrries element size near boundaries
 Field[12] = Threshold;
 Field[12].InField = 11;
-Field[12].SizeMin = cavitysize / boundratio;
+Field[12].SizeMin = cavitysize / boundratiocavity;
 Field[12].SizeMax = cavitysize;
 Field[12].DistMin = 0.0002;
 Field[12].DistMax = 0.005;
@@ -684,11 +746,43 @@ Field[13].NumPointsPerCurve = 100000;
 //Create threshold field that varrries element size near boundaries
 Field[14] = Threshold;
 Field[14].InField = 13;
-Field[14].SizeMin = cavitysize / boundratio;
-Field[14].SizeMax = cavitysize;
+Field[14].SizeMin = samplesize / boundratiosurround;
+Field[14].SizeMax = samplesize;
 Field[14].DistMin = 0.0002;
 Field[14].DistMax = 0.005;
 Field[14].StopAtDistMax = 1;
+
+// Create distance field from curves, injector only
+Field[15] = Distance;
+Field[15].CurvesList = {l_injector_bottom, l_injector_top};
+Field[15].NumPointsPerCurve = 10000;
+
+//Create threshold field that varies element size near boundaries
+Field[16] = Threshold;
+Field[16].InField = 15;
+Field[16].SizeMin = injectorsize / boundratioinjector;
+Field[16].SizeMax = injectorsize;
+Field[16].DistMin = 0.000001;
+Field[16].DistMax = 0.0005;
+Field[16].StopAtDistMax = 1;
+
+// Create distance field from curves, sample/fluid interface
+Field[17] = Distance;
+Field[17].CurvesList = {
+  l_postcavity_flat_1,
+  l_cavity_rear_3,
+  l_cavity_rear_4
+};
+Field[17].NumPointsPerCurve = 100000;
+
+//Create threshold field that varies element size near boundaries
+Field[18] = Threshold;
+Field[18].InField = 17;
+Field[18].SizeMin = cavitysize / boundratiosample;
+Field[18].SizeMax = cavitysize;
+Field[18].DistMin = 0.0002;
+Field[18].DistMax = 0.005;
+Field[18].StopAtDistMax = 1;
 
 nozzle_start = 0.27;
 nozzle_end = 0.30;
@@ -722,7 +816,8 @@ Field[5].VOut = bigsize;
 
 // background mesh size in the cavity region
 cavity_start = 0.65;
-cavity_end = 0.73;
+//cavity_end = 0.73;
+cavity_end = 0.742;
 Field[6] = Box;
 Field[6].XMin = cavity_start;
 Field[6].XMax = cavity_end;
@@ -732,10 +827,42 @@ Field[6].Thickness = 0.10;    // interpolate from VIn to Vout over a distance ar
 Field[6].VIn = cavitysize;
 Field[6].VOut = bigsize;
 
+// background mesh size for the injector
+injector_start = 0.69;
+injector_end = 0.75;
+injector_bottom = -0.0215;
+injector_top = -0.025;
+Field[7] = Box;
+Field[7].XMin = injector_start;
+Field[7].XMax = injector_end;
+Field[7].YMin = injector_bottom;
+Field[7].YMax = injector_top;
+Field[7].Thickness = 0.10;    // interpolate from VIn to Vout over a distance around the box
+Field[7].VIn = injectorsize;
+Field[7].VOut = bigsize;
+
+// background mesh size in the sample region
+Field[8] = Constant;
+Field[8].SurfacesList = {2,3};
+Field[8].VIn = samplesize;
+Field[8].VOut = bigsize;
+
+// keep the injector boundary spacing in the fluid mesh only
+Field[20] = Restrict;
+Field[20].SurfacesList = {1};
+Field[20].InField = 16;
+
+Field[21] = Restrict;
+Field[21].SurfacesList = {1};
+Field[21].InField = 7;
 
 // take the minimum of all defined meshing fields
 Field[100] = Min;
-Field[100].FieldsList = {2, 3, 4, 5, 6, 12, 14};
+//Field[100].FieldsList = {2, 3, 4, 5, 6, 7, 12, 14, 16};
+//Field[100].FieldsList = {2, 3, 4, 5, 6, 8, 12, 14, 16, 18};
+Field[100].FieldsList = {2, 3, 4, 5, 6, 8, 12, 14, 18, 20, 21};
+//Field[100].FieldsList = {2, 3, 4, 5, 6, 8};
+//Field[100].FieldsList = {8};
 Background Field = 100;
 
 Mesh.MeshSizeExtendFromBoundary = 0;
