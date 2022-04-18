@@ -1,6 +1,4 @@
 nviz: 10
-viz_level: 3
-viz_interval_type: 0
 nrestart: 10
 nhealth: 1
 nstatus: 1

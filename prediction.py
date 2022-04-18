@@ -893,11 +893,16 @@ def main(ctx_factory=cl.create_some_context,
     nhealth = 1
     nrestart = 5000
     nstatus = 1
+    # verbosity for what gets written to viz dumps, increase for more stuff
+    viz_level = 1
+    # control the time interval for writing viz dumps
+    viz_interval_type = 0
 
     # default timestepping control
     integrator = "rk4"
     current_dt = 1e-8
     t_final = 1e-7
+    t_viz_interval = 1.e-8
     current_t = 0
     current_step = 0
     current_cfl = 1.0
@@ -965,6 +970,18 @@ def main(ctx_factory=cl.create_some_context,
         input_data = comm.bcast(input_data, root=0)
         try:
             nviz = int(input_data["nviz"])
+        except KeyError:
+            pass
+        try:
+            t_viz_interval = float(input_data["t_viz_interval"])
+        except KeyError:
+            pass
+        try:
+            viz_interval_type = int(input_data["viz_interval_type"])
+        except KeyError:
+            pass
+        try:
+            viz_level = int(input_data["viz_level"])
         except KeyError:
             pass
         try:
@@ -1099,6 +1116,10 @@ def main(ctx_factory=cl.create_some_context,
         error_message = "Invalid time integrator: {}".format(integrator)
         raise RuntimeError(error_message)
 
+    if viz_interval_type > 2:
+        error_message = "Invalid value for viz_interval_type [0-2]"
+        raise RuntimeError(error_message)
+
     s0_sc = np.log10(1.0e-4 / np.power(order, 4))
     if rank == 0:
         print(f"Shock capturing parameters: alpha {alpha_sc}, "
@@ -1106,7 +1127,6 @@ def main(ctx_factory=cl.create_some_context,
 
     if rank == 0:
         print("\n#### Simluation control data: ####")
-        print(f"\tnviz = {nviz}")
         print(f"\tnrestart = {nrestart}")
         print(f"\tnhealth = {nhealth}")
         print(f"\tnstatus = {nstatus}")
@@ -1116,6 +1136,29 @@ def main(ctx_factory=cl.create_some_context,
         print(f"\tdimen = {dim}")
         print(f"\tTime integration {integrator}")
         print("#### Simluation control data: ####\n")
+
+    if rank == 0:
+        print("\n#### Visualization setup: ####")
+        if viz_level >= 0:
+            print("\tBasic visualization output enabled.")
+            print("\t(cv, dv, cfl)")
+        if viz_level >= 1:
+            print("\tExtra visualization output enabled for derived quantities.")
+            print("\t(velocity, mass_fractions, etc.)")
+        if viz_level >= 2:
+            print("\tNon-dimensional parameter visualization output enabled.")
+            print("\t(Re, Pr, etc.)")
+        if viz_level >= 3:
+            print("\tDebug visualization output enabled.")
+            print("\t(rhs, grad_cv, etc.)")
+        if viz_interval_type == 0:
+            print(f"\tWriting viz data every {nviz} steps.")
+        if viz_interval_type == 1:
+            print(f"\tWriting viz data roughly every {t_viz_interval} seconds.")
+        if viz_interval_type == 2:
+            print(f"\tWriting viz data exactly every {t_viz_interval} seconds.")
+        print("#### Visualization setup: ####")
+
     if rank == 0:
         print("\n#### Simluation setup data: ####")
         print(f"\ttotal_pres_injection = {total_pres_inj}")
@@ -1288,14 +1331,37 @@ def main(ctx_factory=cl.create_some_context,
     else:
         cantera_soln.TPY = temp_inflow, pres_inflow, y
         rho_inflow = cantera_soln.density
-        gamma_loc = cantera_soln.cp_mass/cantera_soln.cv_mass
-        sos = math.sqrt(gamma_loc*pres_inflow/rho_inflow)
+        inlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+
+        gamma_error = (gamma - inlet_gamma)
+        gamma_guess = inlet_gamma
+        toler = 1.e-6
+        # iterate over the gamma/mach since gamma = gamma(T)
+        while gamma_error > toler:
+
+            inlet_mach = getMachFromAreaRatio(area_ratio=inlet_area_ratio,
+                                              gamma=gamma_guess,
+                                              mach_guess=0.01)
+            pres_inflow = getIsentropicPressure(mach=inlet_mach,
+                                                P0=total_pres_inflow,
+                                                gamma=gamma_guess)
+            temp_inflow = getIsentropicTemperature(mach=inlet_mach,
+                                                   T0=total_temp_inflow,
+                                                   gamma=gamma_guess)
+            cantera_soln.TPY = temp_inflow, pres_inflow, y
+            rho_inflow = cantera_soln.density
+            inlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+            gamma_error = (gamma_guess - inlet_gamma)
+            gamma_guess = inlet_gamma
+
+        sos = math.sqrt(inlet_gamma*pres_inflow/rho_inflow)
 
     vel_inflow[0] = inlet_mach*sos
 
     if rank == 0:
         print("#### Simluation initialization data: ####")
         print(f"\tinlet Mach number {inlet_mach}")
+        print(f"\tinlet gamma {inlet_gamma}")
         print(f"\tinlet temperature {temp_inflow}")
         print(f"\tinlet pressure {pres_inflow}")
         print(f"\tinlet rho {rho_inflow}")
@@ -1318,50 +1384,92 @@ def main(ctx_factory=cl.create_some_context,
     else:
         cantera_soln.TPY = temp_outflow, pres_outflow, y
         rho_outflow = cantera_soln.density
-        gamma_loc = cantera_soln.cp_mass/cantera_soln.cv_mass
-        sos = math.sqrt(gamma_loc*pres_outflow/rho_outflow)
+        outlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+
+        gamma_error = (gamma - outlet_gamma)
+        gamma_guess = outlet_gamma
+        toler = 1.e-6
+        # iterate over the gamma/mach since gamma = gamma(T)
+        while gamma_error > toler:
+
+            outlet_mach = getMachFromAreaRatio(area_ratio=outlet_area_ratio,
+                                              gamma=gamma_guess,
+                                              mach_guess=0.01)
+            pres_outflow = getIsentropicPressure(mach=outlet_mach,
+                                                P0=total_pres_inflow,
+                                                gamma=gamma_guess)
+            temp_outflow = getIsentropicTemperature(mach=outlet_mach,
+                                                   T0=total_temp_inflow,
+                                                   gamma=gamma_guess)
+            cantera_soln.TPY = temp_outflow, pres_outflow, y
+            rho_outflow = cantera_soln.density
+            outlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+            gamma_error = (gamma_guess - outlet_gamma)
+            gamma_guess = outlet_gamma
 
     vel_outflow[0] = outlet_mach*math.sqrt(gamma*pres_outflow/rho_outflow)
 
     if rank == 0:
+        print("\t********")
         print(f"\toutlet Mach number {outlet_mach}")
+        print(f"\toutlet gamma {outlet_gamma}")
         print(f"\toutlet temperature {temp_outflow}")
         print(f"\toutlet pressure {pres_outflow}")
         print(f"\toutlet rho {rho_outflow}")
         print(f"\toutlet velocity {vel_outflow[0]}")
-        print("#### Simluation initialization data: ####\n")
 
     # injection mach number
     if nspecies < 3:
-        gamma_inj = gamma
+        gamma_injection = gamma
     else:
         #MJA: Todo, get the gamma from cantera to get the correct inflow properties
         # needs to be iterative with the call below
-        gamma_inj = 0.5*(1.24 + 1.4)
+        gamma_injection = 0.5*(1.24 + 1.4)
 
     pres_injection = getIsentropicPressure(mach=mach_inj,
                                            P0=total_pres_inj,
-                                           gamma=gamma_inj)
+                                           gamma=gamma_injection)
     temp_injection = getIsentropicTemperature(mach=mach_inj,
                                               T0=total_temp_inj,
-                                              gamma=gamma_inj)
+                                              gamma=gamma_injection)
 
     if nspecies < 3:
         rho_injection = pres_injection/temp_injection/r
         sos = math.sqrt(gamma*pres_injection/rho_injection)
     else:
-        cantera_soln.TPY = temp_injection, pres_injection, y_fuel
+        cantera_soln.TPY = temp_outflow, pres_outflow, y_fuel
         rho_injection = cantera_soln.density
-        gamma_loc = cantera_soln.cp_mass/cantera_soln.cv_mass
-        sos = math.sqrt(gamma_loc*pres_injection/rho_injection)
-        if rank == 0:
-            print(f"injection gamma guess {gamma_inj} cantera gamma {gamma_loc}")
+        gamma_injection = cantera_soln.cp_mass/cantera_soln.cv_mass
+
+        gamma_error = (gamma - gamma_injection)
+        gamma_guess = gamma_injection
+        toler = 1.e-6
+        # iterate over the gamma/mach since gamma = gamma(T)
+        while gamma_error > toler:
+
+            outlet_mach = getMachFromAreaRatio(area_ratio=outlet_area_ratio,
+                                              gamma=gamma_guess,
+                                              mach_guess=0.01)
+            pres_outflow = getIsentropicPressure(mach=outlet_mach,
+                                                P0=total_pres_inj,
+                                                gamma=gamma_guess)
+            temp_outflow = getIsentropicTemperature(mach=outlet_mach,
+                                                   T0=total_temp_inj,
+                                                   gamma=gamma_guess)
+            cantera_soln.TPY = temp_outflow, pres_outflow, y_fuel
+            rho_outflow = cantera_soln.density
+            outlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+            gamma_error = (gamma_guess - gamma_injection)
+            gamma_guess = gamma_injection
+
+        sos = math.sqrt(gamma_injection*pres_injection/rho_injection)
 
     vel_injection[0] = -mach_inj*sos
 
     if rank == 0:
-        print("")
+        print("\t********")
         print(f"\tinjector Mach number {mach_inj}")
+        print(f"\tinjector gamma {gamma_injection}")
         print(f"\tinjector temperature {temp_injection}")
         print(f"\tinjector pressure {pres_injection}")
         print(f"\tinjector rho {rho_injection}")
@@ -1385,7 +1493,8 @@ def main(ctx_factory=cl.create_some_context,
                           P0=total_pres_inflow, T0=total_temp_inflow,
                           temp_wall=temp_wall, temp_sigma=temp_sigma,
                           vel_sigma=vel_sigma, nspecies=nspecies,
-                          mass_frac=y, gamma_guess=gamma, inj_gamma_guess=gamma_inj,
+                          mass_frac=y, gamma_guess=inlet_gamma,
+                          inj_gamma_guess=gamma_injection,
                           inj_pres=total_pres_inj,
                           inj_temp=total_temp_inj,
                           inj_vel=vel_injection, inj_mass_frac=y_fuel,
@@ -1744,35 +1853,102 @@ def main(ctx_factory=cl.create_some_context,
     grad_t_operator = actx.compile(_grad_t_operator)
 
     def my_write_viz(step, t, fluid_state, wall_temperature, ts_field, alpha_field):
+
+        if rank == 0:
+            print(f"******** Writing Visualization File at {step}, "
+                  f"sim time {t:1.6e} s ********")
+
         cv = fluid_state.cv
         dv = fluid_state.dv
-        tagged_cells = smoothness_indicator(
-            discr, cv.mass, s0=s0_sc, kappa=kappa_sc, volume_dd=dd_vol_fluid)
 
-        grad_temperature = grad_t_operator(t, fluid_state, wall_temperature)
-        fluid_grad_temperature = grad_temperature[0]
-        wall_grad_temperature = grad_temperature[1]
-
-        mach = (actx.np.sqrt(np.dot(cv.velocity, cv.velocity)) /
-                            dv.speed_of_sound)
-        fluid_viz_fields = [
-            ("cv", cv),
-            ("dv", dv),
-            ("mach", mach),
-            ("velocity", cv.velocity),
-            ("grad_temperature", fluid_grad_temperature),
-            ("sponge_sigma", sponge_sigma),
-            ("alpha", alpha_field),
-            ("tagged_cells", tagged_cells),
-            ("dt" if constant_cfl else "cfl", ts_field)]
+        # basic viz quantities, things here are difficult (or impossible) to compute
+        # in post-processing
+        fluid_viz_fields = [("cv", cv),
+                      ("dv", dv),
+                      ("dt" if constant_cfl else "cfl", ts_field)]
         wall_viz_fields = [
-            ("temperature", wall_temperature),
-            ("grad_temperature", wall_grad_temperature),
-            ("kappa", wall_model.thermal_conductivity)]
-        # species mass fractions
-        fluid_viz_fields.extend(
-            ("Y_"+species_names[i], cv.species_mass_fractions[i])
-            for i in range(nspecies))
+            ("temperature", wall_temperature)]
+
+        # extra viz quantities, things here are often used for post-processing
+        if viz_level > 0:
+            mach = cv.speed / dv.speed_of_sound
+            tagged_cells = smoothness_indicator(discr, cv.mass, s0=s0_sc,
+                                                kappa=kappa_sc,
+                                                volume_dd=dd_vol_fluid)
+
+            fluid_viz_ext = [("mach", mach),
+                       ("velocity", cv.velocity),
+                       ("alpha", alpha_field),
+                       ("tagged_cells", tagged_cells)]
+            fluid_viz_fields.extend(fluid_viz_ext)
+            # species mass fractions
+            fluid_viz_fields.extend(
+                ("Y_"+species_names[i], cv.species_mass_fractions[i])
+                for i in range(nspecies))
+
+        # additional viz quantities, add in some non-dimensional numbers
+        if viz_level > 1:
+            from grudge.dt_utils import characteristic_lengthscales
+            char_length = characteristic_lengthscales(cv.array_context, discr,
+                                                      dd=dd_vol_fluid)
+            cell_Re = cv.mass*cv.speed*char_length/fluid_state.viscosity
+            cp = gas_model.eos.heat_capacity_cp(cv, fluid_state.temperature)
+            alpha_heat = fluid_state.thermal_conductivity/cp/fluid_state.viscosity
+            cell_Pe_heat = char_length*cv.speed/alpha_heat
+            from mirgecom.viscous import get_local_max_species_diffusivity
+            d_alpha_max = \
+                get_local_max_species_diffusivity(
+                    fluid_state.array_context,
+                    fluid_state.species_diffusivity
+                )
+            cell_Pe_mass = char_length*cv.speed/d_alpha_max
+            # these are useful if our transport properties
+            # are not constant on the mesh
+            # prandtl
+            # schmidt_number
+            # damkohler_number
+
+            viz_ext = [("Re", cell_Re),
+                       ("Pe_mass", cell_Pe_mass),
+                       ("Pe_heat", cell_Pe_heat)]
+            fluid_viz_fields.extend(viz_ext)
+
+        # debbuging viz quantities, things here are used for diagnosing run issues
+        if viz_level > 2:
+            """
+            from mirgecom.fluid import (
+                velocity_gradient,
+                species_mass_fraction_gradient
+            )
+            ns_rhs, grad_cv, grad_t = \
+                ns_operator(discr, state=fluid_state, time=t,
+                            boundaries=boundaries, gas_model=gas_model,
+                            return_gradients=True)
+            grad_v = velocity_gradient(cv, grad_cv)
+            grad_y = species_mass_fraction_gradient(cv, grad_cv)
+            """
+
+            grad_temperature = grad_t_operator(t, fluid_state, wall_temperature)
+            fluid_grad_temperature = grad_temperature[0]
+            wall_grad_temperature = grad_temperature[1]
+
+            viz_ext = [("grad_temperature", fluid_grad_temperature)]
+            """
+            viz_ext = [("rhs", ns_rhs),
+                       ("grad_temperature", fluid_grad_temperature),
+                       ("grad_v_x", grad_v[0]),
+                       ("grad_v_y", grad_v[1])]
+            if dim == 3:
+                viz_ext.extend(("grad_v_z", grad_v[2]))
+
+            viz_ext.extend(("grad_Y_"+species_names[i], grad_y[i])
+                           for i in range(nspecies))
+            fluid_viz_fields.extend(viz_ext)
+            """
+
+            viz_ext = [("grad_temperature", wall_grad_temperature)]
+            wall_viz_fields.extend(viz_ext)
+
         write_visfile(
             discr, fluid_viz_fields, fluid_visualizer,
             vizname=vizname+"-fluid", step=step, t=t, overwrite=True)
@@ -1780,7 +1956,14 @@ def main(ctx_factory=cl.create_some_context,
             discr, wall_viz_fields, wall_visualizer,
             vizname=vizname+"-wall", step=step, t=t, overwrite=True)
 
+        if rank == 0:
+            print("******** Done Writing Visualization File ********\n")
+
     def my_write_restart(step, t, state):
+        if rank == 0:
+            print(f"******** Writing Restart File at {step=}, "
+                  f"sim time {t:1.6e} s ********")
+
         cv, wall_temperature, tseed = state
         restart_fname = restart_pattern.format(cname=casename, step=step, rank=rank)
         if restart_fname != restart_filename:
@@ -1796,6 +1979,9 @@ def main(ctx_factory=cl.create_some_context,
                 "num_parts": nparts
             }
             write_restart_file(actx, restart_data, restart_fname, comm)
+
+        if rank == 0:
+            print("******** Done Writing Restart File ********\n")
 
     def my_health_check(cv, dv):
         # FIXME: Add health check for wall temperature?

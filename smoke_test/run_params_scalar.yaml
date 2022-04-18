@@ -1,13 +1,11 @@
 nviz: 10
-viz_level: 3
-viz_interval_type: 0
 nrestart: 10
 nhealth: 1
 nstatus: 1
 current_dt: 5.0e-10
 t_final: 2.e-8
 #t_final: 1.e-9
-nspecies:  7
+nspecies:  2
 order:  2
 alpha_sc: 0.01
 s0_sc: -5.0
