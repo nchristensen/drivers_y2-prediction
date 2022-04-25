@@ -42,6 +42,7 @@ from grudge.discretization import make_discretization_collection
 from grudge.shortcuts import make_visualizer
 from grudge.dof_desc import VolumeDomainTag, DOFDesc
 from grudge.op import nodal_max, nodal_min
+from grudge.dof_desc import DD_VOLUME_ALL
 from logpyle import IntervalTimer, set_dt
 from mirgecom.logging_quantities import (
     initialize_logmgr,
@@ -56,8 +57,7 @@ from mirgecom.simutil import (
     distribute_mesh,
     write_visfile,
     check_naninf_local,
-    check_range_local,
-    get_sim_timestep
+    check_range_local
 )
 from mirgecom.restart import write_restart_file
 from mirgecom.io import make_init_message
@@ -904,9 +904,11 @@ def main(ctx_factory=cl.create_some_context,
     t_final = 1e-7
     t_viz_interval = 1.e-8
     current_t = 0
+    t_start = 0.
     current_step = 0
     current_cfl = 1.0
     constant_cfl = False
+    last_viz_interval = 0
 
     # default health status bounds
     health_pres_min = 1.0e-1
@@ -997,7 +999,15 @@ def main(ctx_factory=cl.create_some_context,
         except KeyError:
             pass
         try:
+            constant_cfl = int(input_data["constant_cfl"])
+        except KeyError:
+            pass
+        try:
             current_dt = float(input_data["current_dt"])
+        except KeyError:
+            pass
+        try:
+            current_cfl = float(input_data["current_cfl"])
         except KeyError:
             pass
         try:
@@ -1130,7 +1140,10 @@ def main(ctx_factory=cl.create_some_context,
         print(f"\tnrestart = {nrestart}")
         print(f"\tnhealth = {nhealth}")
         print(f"\tnstatus = {nstatus}")
-        print(f"\tcurrent_dt = {current_dt}")
+        if constant_cfl == 1:
+            print(f"\tConstant cfl mode, current_cfl = {current_cfl}")
+        else:
+            print(f"\tConstant dt mode, current_dt = {current_dt}")
         print(f"\tt_final = {t_final}")
         print(f"\torder = {order}")
         print(f"\tdimen = {dim}")
@@ -1328,6 +1341,7 @@ def main(ctx_factory=cl.create_some_context,
     if nspecies < 3:
         rho_inflow = pres_inflow/temp_inflow/r
         sos = math.sqrt(gamma*pres_inflow/rho_inflow)
+        inlet_gamma = gamma
     else:
         cantera_soln.TPY = temp_inflow, pres_inflow, y
         rho_inflow = cantera_soln.density
@@ -1381,6 +1395,7 @@ def main(ctx_factory=cl.create_some_context,
     if nspecies < 3:
         rho_outflow = pres_outflow/temp_outflow/r
         sos = math.sqrt(gamma*pres_outflow/rho_outflow)
+        outlet_gamma = gamma
     else:
         cantera_soln.TPY = temp_outflow, pres_outflow, y
         rho_outflow = cantera_soln.density
@@ -1517,6 +1532,8 @@ def main(ctx_factory=cl.create_some_context,
         restart_data = read_restart_data(actx, restart_filename)
         current_step = restart_data["step"]
         current_t = restart_data["t"]
+        last_viz_interval = restart_data["last_viz_interval"]
+        t_start = current_t
         volume_to_local_mesh_data = restart_data["volume_to_local_mesh_data"]
         global_nelements = restart_data["global_nelements"]
         restart_order = int(restart_data["order"])
@@ -1595,6 +1612,10 @@ def main(ctx_factory=cl.create_some_context,
         wall_vol_discr, actx, wall_tag_to_elements["wall_insert"])
     wall_surround_mask = mask_from_elements(
         wall_vol_discr, actx, wall_tag_to_elements["wall_surround"])
+
+    from grudge.dt_utils import characteristic_lengthscales
+    char_length = characteristic_lengthscales(actx, discr, dd=dd_vol_fluid)
+    char_length_wall = characteristic_lengthscales(actx, discr, dd=dd_vol_wall)
 
     if rank == 0:
         logger.info("Before restart/init")
@@ -1803,9 +1824,10 @@ def main(ctx_factory=cl.create_some_context,
     def vol_max(x):
         return actx.to_numpy(nodal_max(discr, "vol", x))[()]
 
-    def my_write_status(cv, dv, wall_temperature, dt, cfl):
-        # MJA TODO: Add status for wall CFL
-        status_msg = f"-------- dt = {dt:1.3e}, cfl = {cfl:1.4f}"
+    def my_write_status(cv, dv, wall_temperature, dt, cfl_fluid, cfl_wall):
+        status_msg = (f"-------- dt = {dt:1.3e},"
+                      f" cfl_fluid = {cfl_fluid:1.4f}"
+                      f" cfl_wall = {cfl_wall:1.4f}")
         temperature = thaw(freeze(dv.temperature, actx), actx)
         pressure = thaw(freeze(dv.pressure, actx), actx)
         wall_temp = thaw(freeze(wall_temperature, actx), actx)
@@ -1852,11 +1874,13 @@ def main(ctx_factory=cl.create_some_context,
 
     grad_t_operator = actx.compile(_grad_t_operator)
 
-    def my_write_viz(step, t, fluid_state, wall_temperature, ts_field, alpha_field):
+    def my_write_viz(step, t, fluid_state, wall_temperature, ts_field_fluid,
+                     ts_field_wall, alpha_field, dump_number):
 
         if rank == 0:
-            print(f"******** Writing Visualization File at {step}, "
-                  f"sim time {t:1.6e} s ********")
+            print(f"******** Writing Visualization File {dump_number}"
+                  f" at step {step},"
+                  f" sim time {t:1.6e} s ********")
 
         cv = fluid_state.cv
         dv = fluid_state.dv
@@ -1865,9 +1889,10 @@ def main(ctx_factory=cl.create_some_context,
         # in post-processing
         fluid_viz_fields = [("cv", cv),
                       ("dv", dv),
-                      ("dt" if constant_cfl else "cfl", ts_field)]
+                      ("dt" if constant_cfl else "cfl", ts_field_fluid)]
         wall_viz_fields = [
-            ("temperature", wall_temperature)]
+            ("temperature", wall_temperature),
+            ("dt" if constant_cfl else "cfl", ts_field_wall)]
 
         # extra viz quantities, things here are often used for post-processing
         if viz_level > 0:
@@ -1888,9 +1913,6 @@ def main(ctx_factory=cl.create_some_context,
 
         # additional viz quantities, add in some non-dimensional numbers
         if viz_level > 1:
-            from grudge.dt_utils import characteristic_lengthscales
-            char_length = characteristic_lengthscales(cv.array_context, discr,
-                                                      dd=dd_vol_fluid)
             cell_Re = cv.mass*cv.speed*char_length/fluid_state.viscosity
             cp = gas_model.eos.heat_capacity_cp(cv, fluid_state.temperature)
             alpha_heat = fluid_state.thermal_conductivity/cp/fluid_state.viscosity
@@ -1912,6 +1934,12 @@ def main(ctx_factory=cl.create_some_context,
                        ("Pe_mass", cell_Pe_mass),
                        ("Pe_heat", cell_Pe_heat)]
             fluid_viz_fields.extend(viz_ext)
+
+            cell_alpha = wall_model.thermal_diffusivity()
+
+            viz_ext = [
+                       ("alpha", cell_alpha)]
+            wall_viz_fields.extend(viz_ext)
 
         # debbuging viz quantities, things here are used for diagnosing run issues
         if viz_level > 2:
@@ -1951,17 +1979,17 @@ def main(ctx_factory=cl.create_some_context,
 
         write_visfile(
             discr, fluid_viz_fields, fluid_visualizer,
-            vizname=vizname+"-fluid", step=step, t=t, overwrite=True)
+            vizname=vizname+"-fluid", step=dump_number, t=t, overwrite=True)
         write_visfile(
             discr, wall_viz_fields, wall_visualizer,
-            vizname=vizname+"-wall", step=step, t=t, overwrite=True)
+            vizname=vizname+"-wall", step=dump_number, t=t, overwrite=True)
 
         if rank == 0:
             print("******** Done Writing Visualization File ********\n")
 
     def my_write_restart(step, t, state):
         if rank == 0:
-            print(f"******** Writing Restart File at {step=}, "
+            print(f"******** Writing Restart File at step {step}, "
                   f"sim time {t:1.6e} s ********")
 
         cv, wall_temperature, tseed = state
@@ -1975,6 +2003,7 @@ def main(ctx_factory=cl.create_some_context,
                 "t": t,
                 "step": step,
                 "order": order,
+                "last_viz_interval": last_viz_interval,
                 "global_nelements": global_nelements,
                 "num_parts": nparts
             }
@@ -2036,11 +2065,6 @@ def main(ctx_factory=cl.create_some_context,
         :class:`~meshmode.dof_array.DOFArray`
             The maximum stable timestep at each node.
         """
-        from grudge.dt_utils import characteristic_lengthscales
-
-        length_scales = characteristic_lengthscales(
-            fluid_state.array_context, discr, dd=dd_vol_fluid)
-
         nu = 0
         d_alpha_max = 0
 
@@ -2054,67 +2078,200 @@ def main(ctx_factory=cl.create_some_context,
                 )
 
         return(
-            length_scales / (fluid_state.wavespeed
-            + ((nu + d_alpha_max + alpha) / length_scales))
+            char_length / (fluid_state.wavespeed
+            + ((nu + d_alpha_max + alpha) / char_length))
         )
 
-    def my_get_viscous_cfl(discr, dt, fluid_state, alpha):
-        """Calculate and return node-local CFL based on current state and timestep.
+    def my_get_wall_timestep(discr, wall_state, wall_model):
+        """Routine returns the the node-local maximum stable thermal timestep.
 
         Parameters
         ----------
-        discr: :class:`grudge.eager.EagerDGDiscretization`
+        discr: grudge.eager.EagerDGDiscretization
             the discretization to use
-        dt: float or :class:`~meshmode.dof_array.DOFArray`
-            A constant scalar dt or node-local dt
-        fluid_state: :class:`~mirgecom.gas_model.FluidState`
-            Full fluid state including conserved and thermal state
-        alpha: :class:`~meshmode.dof_array.DOFArray`
-            Arfifical viscosity
 
         Returns
         -------
         :class:`~meshmode.dof_array.DOFArray`
-            The CFL at each node.
+            The maximum stable timestep at each node.
         """
-        return dt / my_get_viscous_timestep(
-            discr, fluid_state=fluid_state, alpha=alpha)
 
-    def my_get_timestep(t, dt, fluid_state, alpha):
-        # FIXME: Take into account wall timestep restriction
-        t_remaining = max(0, t_final - t)
+        return(char_length_wall*char_length_wall/wall_model.thermal_diffusivity())
+
+    def _my_get_timestep_wall(
+            discr, wall_state, wall_model, t, dt, cfl, t_final, constant_cfl=False,
+            wall_volume_dd=DD_VOLUME_ALL):
+        """Return the maximum stable timestep for a typical heat transfer simulation.
+
+        This routine returns *dt*, the users defined constant timestep, or *max_dt*,
+        the maximum domain-wide stability-limited timestep for a fluid simulation.
+
+        .. important::
+            This routine calls the collective: :func:`~grudge.op.nodal_min` on the
+            inside which makes it domain-wide regardless of parallel domain
+            decomposition. Thus this routine must be called *collectively*
+            (i.e. by all ranks).
+
+        Two modes are supported:
+            - Constant DT mode: returns the minimum of (t_final-t, dt)
+            - Constant CFL mode: returns (cfl * max_dt)
+
+        Parameters
+        ----------
+        discr
+            Grudge discretization or discretization collection?
+        t: float
+            Current time
+        t_final: float
+            Final time
+        dt: float
+            The current timestep
+        cfl: float
+            The current CFL number
+        constant_cfl: bool
+            True if running constant CFL mode
+
+        Returns
+        -------
+        float
+            The dt (contant cfl) or cfl (constant dt) at every point in the mesh
+        float
+            The minimum stable cfl based on conductive heat transfer
+        float
+            The maximum stable DT based on conductive heat transfer
+        """
+        mydt = dt
         if constant_cfl:
-            ts_field = current_cfl * my_get_viscous_timestep(
-                discr, fluid_state=fluid_state, alpha=alpha)
             from grudge.op import nodal_min
-            dt = actx.to_numpy(nodal_min(discr, dd_vol_fluid, ts_field))
-            cfl = current_cfl
+            ts_field = cfl*my_get_wall_timestep(
+                discr=discr, wall_state=wall_state, wall_model=wall_model)
+            mydt = wall_state.array_context.to_numpy(nodal_min(
+                    discr, wall_volume_dd, ts_field))[()]
         else:
-            ts_field = my_get_viscous_cfl(
-                discr, dt=dt, fluid_state=fluid_state, alpha=alpha)
             from grudge.op import nodal_max
-            cfl = actx.to_numpy(nodal_max(discr, dd_vol_fluid, ts_field))
+            ts_field = mydt/my_get_wall_timestep(
+                discr=discr, wall_state=wall_state, wall_model=wall_model)
+            cfl = wall_state.array_context.to_numpy(nodal_max(
+                    discr, wall_volume_dd, ts_field))[()]
 
-        return ts_field, cfl, min(t_remaining, dt)
+        return ts_field, cfl, mydt
+
+    #my_get_timestep = actx.compile(_my_get_timestep)
+    my_get_timestep_wall = _my_get_timestep_wall
+
+    def _my_get_timestep(
+            discr, fluid_state, alpha, t, dt, cfl, t_final, constant_cfl=False,
+            fluid_volume_dd=DD_VOLUME_ALL):
+        """Return the maximum stable timestep for a typical fluid simulation.
+
+        This routine returns *dt*, the users defined constant timestep, or *max_dt*,
+        the maximum domain-wide stability-limited timestep for a fluid simulation.
+
+        .. important::
+            This routine calls the collective: :func:`~grudge.op.nodal_min` on the
+            inside which makes it domain-wide regardless of parallel domain
+            decomposition. Thus this routine must be called *collectively*
+            (i.e. by all ranks).
+
+        Two modes are supported:
+            - Constant DT mode: returns the minimum of (t_final-t, dt)
+            - Constant CFL mode: returns (cfl * max_dt)
+
+        Parameters
+        ----------
+        discr
+            Grudge discretization or discretization collection?
+        fluid_state: :class:`~mirgecom.gas_model.FluidState`
+            The full fluid conserved and thermal state
+        t: float
+            Current time
+        t_final: float
+            Final time
+        dt: float
+            The current timestep
+        cfl: float
+            The current CFL number
+        alpha: :class:`~meshmode.dof_array.DOFArray`
+            The contribution from artificial viscosity
+        constant_cfl: bool
+            True if running constant CFL mode
+
+        Returns
+        -------
+        float
+            The dt (contant cfl) or cfl (constant dt) at every point in the mesh
+        float
+            The minimum stable cfl based on a viscous fluid.
+        float
+            The maximum stable DT based on a viscous fluid.
+        """
+        mydt = dt
+        if constant_cfl:
+            from grudge.op import nodal_min
+            ts_field = cfl*my_get_viscous_timestep(
+                discr=discr, fluid_state=fluid_state, alpha=alpha)
+            mydt = fluid_state.array_context.to_numpy(nodal_min(
+                    discr, fluid_volume_dd, ts_field))[()]
+        else:
+            from grudge.op import nodal_max
+            ts_field = mydt/my_get_viscous_timestep(
+                discr=discr, fluid_state=fluid_state, alpha=alpha)
+            cfl = fluid_state.array_context.to_numpy(nodal_max(
+                    discr, fluid_volume_dd, ts_field))[()]
+
+        return ts_field, cfl, mydt
+
+    #my_get_timestep = actx.compile(_my_get_timestep)
+    my_get_timestep = _my_get_timestep
 
     def my_get_alpha(discr, fluid_state, alpha):
         """ Scale alpha by the element characteristic length """
-        from grudge.dt_utils import characteristic_lengthscales
-        array_context = fluid_state.array_context
-        length_scales = characteristic_lengthscales(
-            array_context, discr, dd=dd_vol_fluid)
 
         #from mirgecom.fluid import compute_wavespeed
         #wavespeed = compute_wavespeed(eos, fluid_state)
 
-        vmag = array_context.np.sqrt(
-            np.dot(fluid_state.velocity, fluid_state.velocity))
         #alpha_field = alpha*wavespeed*length_scales
-        alpha_field = alpha*vmag*length_scales
+        alpha_field = alpha*fluid_state.speed*char_length
         #alpha_field = wavespeed*0 + alpha*current_step
         #alpha_field = state.mass
 
         return alpha_field
+
+    def _check_time(time, dt, interval, interval_type):
+        toler = 1.e-6
+        status = False
+
+        dumps_so_far = math.floor((time-t_start)/interval)
+
+        # dump if we just passed a dump interval
+        if interval_type == 2:
+            time_till_next = (dumps_so_far + 1)*interval - time
+            steps_till_next = math.floor(time_till_next/dt)
+
+            # reduce the timestep going into a dump to avoid a big variation in dt
+            if steps_till_next < 5:
+                dt_new = dt
+                extra_time = time_till_next - steps_till_next*dt
+                #if actx.np.abs(extra_time/dt) > toler:
+                if abs(extra_time/dt) > toler:
+                    dt_new = time_till_next/(steps_till_next + 1)
+
+                if steps_till_next < 1:
+                    dt_new = time_till_next
+
+                dt = dt_new
+
+            time_from_last = time - t_start - (dumps_so_far)*interval
+            if abs(time_from_last/dt) < toler:
+                status = True
+        else:
+            time_from_last = time - t_start - (dumps_so_far)*interval
+            if time_from_last < dt:
+                status = True
+
+        return status, dt, dumps_so_far + last_viz_interval
+
+    check_time = _check_time
 
     def my_pre_step(step, t, dt, state):
         cv, wall_temperature, tseed = state
@@ -2127,9 +2284,54 @@ def main(ctx_factory=cl.create_some_context,
                 logmgr.tick_before()
 
             alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
-            ts_field, cfl, dt = my_get_timestep(t, dt, fluid_state, alpha_field)
 
-            do_viz = check_step(step=step, interval=nviz)
+            ts_field_fluid, cfl_fluid, dt_fluid = my_get_timestep(
+                discr=discr, fluid_state=fluid_state, alpha=alpha_field,
+                t=t, dt=dt, cfl=current_cfl, t_final=t_final,
+                constant_cfl=constant_cfl, fluid_volume_dd=dd_vol_fluid)
+
+            ts_field_wall, cfl_wall, dt_wall = my_get_timestep_wall(
+                discr=discr, wall_state=wall_temperature,
+                wall_model=wall_model,
+                t=t, dt=dt, cfl=current_cfl, t_final=t_final,
+                constant_cfl=constant_cfl, wall_volume_dd=dd_vol_wall)
+
+            # adjust time for constant cfl, use the smallest timescale
+            dt_const_cfl = 100.
+            if constant_cfl:
+                dt_const_cfl = np.minimum(dt_fluid, dt_wall)
+
+            # adjust time to hit the final requested time
+            t_remaining = max(0, t_final - t)
+
+            if viz_interval_type == 0:
+                dt = np.minimum(t_remaining, current_dt)
+            else:
+                dt = np.minimum(t_remaining, dt_const_cfl)
+
+            # update our I/O quantities
+            cfl_fluid = dt*cfl_fluid/dt_fluid
+            cfl_wall = dt*cfl_wall/dt_wall
+            ts_field_fluid = dt*ts_field_fluid/dt_wall
+            ts_field_wall = dt*ts_field_wall/dt_wall
+
+            if viz_interval_type == 1:
+                do_viz, dt, next_dump_number = check_time(
+                    time=t, dt=dt, interval=t_viz_interval,
+                    interval_type=viz_interval_type)
+            elif viz_interval_type == 2:
+                dt_sav = dt
+                do_viz, dt, next_dump_number = check_time(
+                    time=t, dt=dt, interval=t_viz_interval,
+                    interval_type=viz_interval_type)
+
+                # adjust cfl by dt
+                cfl_fluid = dt*cfl_fluid/dt_sav
+                cfl_wall = dt*cfl_wall/dt_sav
+            else:
+                do_viz = check_step(step=step, interval=nviz)
+                next_dump_number = step
+
             do_restart = check_step(step=step, interval=nrestart)
             do_health = check_step(step=step, interval=nhealth)
             do_status = check_step(step=step, interval=nstatus)
@@ -2142,7 +2344,8 @@ def main(ctx_factory=cl.create_some_context,
                     raise MyRuntimeError("Failed simulation health check.")
 
             if do_status:
-                my_write_status(dt=dt, cfl=cfl, cv=cv, dv=dv,
+                my_write_status(dt=dt, cfl_fluid=cfl_fluid, cfl_wall=cfl_wall,
+                                cv=cv, dv=dv,
                                 wall_temperature=wall_temperature)
 
             if do_restart:
@@ -2151,22 +2354,27 @@ def main(ctx_factory=cl.create_some_context,
             if do_viz:
                 my_write_viz(
                     step=step, t=t, fluid_state=fluid_state,
-                    wall_temperature=wall_temperature, ts_field=ts_field,
-                    alpha_field=alpha_field)
+                    wall_temperature=wall_temperature,
+                    ts_field_fluid=ts_field_fluid, ts_field_wall=ts_field_wall,
+                    alpha_field=alpha_field, dump_number=next_dump_number)
 
         except MyRuntimeError:
             if rank == 0:
                 logger.error("Errors detected; attempting graceful exit.")
+
+            if viz_interval_type == 0:
+                dump_number = step
+            else:
+                dump_number = (math.floor((t-t_start)/t_viz_interval) +
+                    last_viz_interval)
+
             my_write_viz(
                 step=step, t=t, fluid_state=fluid_state,
-                wall_temperature=wall_temperature, ts_field=ts_field,
-                alpha_field=alpha_field)
+                wall_temperature=wall_temperature,
+                ts_field_fluid=ts_field_fluid, ts_field_wall=ts_field_wall,
+                alpha_field=alpha_field, dump_number=dump_number)
             my_write_restart(step=step, t=t, state=state)
             raise
-
-        dt = get_sim_timestep(
-            discr, fluid_state, t, dt, current_cfl, t_final, constant_cfl,
-            fluid_volume_dd=dd_vol_fluid)
 
         return state, dt
 
@@ -2215,10 +2423,6 @@ def main(ctx_factory=cl.create_some_context,
         tseed_rhs = fluid_state.temperature - temperature_seed
         return make_obj_array([fluid_rhs, wall_rhs, tseed_rhs])
 
-    current_dt = get_sim_timestep(
-        discr, current_fluid_state, current_t, current_dt, current_cfl, t_final,
-        constant_cfl, fluid_volume_dd=dd_vol_fluid)
-
     current_step, current_t, stepper_state = \
         advance_state(rhs=my_rhs, timestepper=timestepper,
                       pre_step_callback=my_pre_step,
@@ -2235,16 +2439,30 @@ def main(ctx_factory=cl.create_some_context,
         logger.info("Checkpointing final state ...")
     final_dv = current_fluid_state.dv
     alpha_field = my_get_alpha(discr, current_fluid_state, alpha_sc)
-    ts_field, cfl, dt = my_get_timestep(
-        t=current_t, dt=current_dt, fluid_state=current_fluid_state,
-        alpha=alpha_field)
-    my_write_status(dt=dt, cfl=cfl, dv=final_dv, cv=current_cv,
+    ts_field_fluid, cfl, dt = my_get_timestep(discr=discr,
+        fluid_state=current_fluid_state,
+        alpha=alpha_field, t=current_t, dt=current_dt, cfl=current_cfl,
+        t_final=t_final, constant_cfl=constant_cfl, fluid_volume_dd=dd_vol_fluid)
+    ts_field_wall, cfl_wall, dt_wall = my_get_timestep_wall(discr=discr,
+        wall_state=current_wall_temperature, wall_model=wall_model,
+        t=current_t, dt=current_dt, cfl=current_cfl,
+        t_final=t_final, constant_cfl=constant_cfl, wall_volume_dd=dd_vol_wall)
+    my_write_status(dt=dt, cfl_fluid=cfl, cfl_wall=cfl_wall,
+                    dv=final_dv, cv=current_cv,
                     wall_temperature=current_wall_temperature)
+
+    if viz_interval_type == 0:
+        dump_number = current_step
+    else:
+        dump_number = (math.floor((current_t-t_start)/t_viz_interval) +
+            last_viz_interval)
 
     my_write_viz(
         step=current_step, t=current_t, fluid_state=current_fluid_state,
-        wall_temperature=current_wall_temperature, ts_field=ts_field,
-        alpha_field=alpha_field)
+        wall_temperature=current_wall_temperature,
+        ts_field_fluid=ts_field_fluid,
+        ts_field_wall=ts_field_wall,
+        alpha_field=alpha_field, dump_number=dump_number)
     my_write_restart(step=current_step, t=current_t, state=stepper_state)
 
     if logmgr:
@@ -2293,7 +2511,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # for writing output
-    casename = "isolator"
+    casename = "prediction"
     if args.casename:
         print(f"Custom casename {args.casename}")
         casename = args.casename.replace("'", "")
