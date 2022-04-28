@@ -1894,6 +1894,9 @@ def main(ctx_factory=cl.create_some_context,
             ("temperature", wall_temperature),
             ("dt" if constant_cfl else "cfl", ts_field_wall)]
 
+        #print(f"{fluid_viz_fields=}")
+        #print(f"{wall_viz_fields=}")
+
         # extra viz quantities, things here are often used for post-processing
         if viz_level > 0:
             mach = cv.speed / dv.speed_of_sound
