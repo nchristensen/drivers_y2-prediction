@@ -2315,7 +2315,7 @@ def main(ctx_factory=cl.create_some_context,
             # update our I/O quantities
             cfl_fluid = dt*cfl_fluid/dt_fluid
             cfl_wall = dt*cfl_wall/dt_wall
-            ts_field_fluid = dt*ts_field_fluid/dt_wall
+            ts_field_fluid = dt*ts_field_fluid/dt_fluid
             ts_field_wall = dt*ts_field_wall/dt_wall
 
             if viz_interval_type == 1:
