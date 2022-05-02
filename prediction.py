@@ -857,17 +857,16 @@ def main(ctx_factory=cl.create_some_context,
         casename = "mirgecom"
 
     # logging and profiling
-    #log_path = "log_data/"
-    log_path = ""
+    log_path = "log_data/"
+    #log_path = ""
     logname = log_path + casename + ".sqlite"
 
-    """
     if rank == 0:
         import os
         log_dir = os.path.dirname(logname)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir)
-    """
+    comm.Barrier()
 
     logmgr = initialize_logmgr(use_logmgr,
         filename=logname, mode="wo", mpi_comm=comm)
