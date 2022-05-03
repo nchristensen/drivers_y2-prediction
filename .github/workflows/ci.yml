@@ -67,39 +67,3 @@ jobs:
             cd smoke_test
             ./run_lazy.sh
 
-        - name: Eager multi-species injection smoke test
-          run: |
-            source emirge/config/activate_env.sh
-            cd smoke_test_injection_2d
-            ln -sf run_params_no_scalar.yaml run_params.yaml
-            ./run_init.sh
-            ./run.sh
-            ln -sf run_params_scalar.yaml run_params.yaml
-            ./run_init.sh
-            ./run.sh
-            ln -sf run_params_multi.yaml run_params.yaml
-            ./run_init.sh
-            ./run.sh
-
-        - name: Lazy multi-species injection smoke test
-          run: |
-            source emirge/config/activate_env.sh
-            cd smoke_test_injection_2d
-            ln -sf run_params_no_scalar.yaml run_params.yaml
-            ./run_init.sh
-            ./run.sh
-            ln -sf run_params_scalar.yaml run_params.yaml
-            ./run_init.sh
-            ./run.sh
-            ln -sf run_params_multi.yaml run_params.yaml
-            ./run_init.sh
-            ./run.sh
-
-        - name: 3D injection smoke test
-          run: |
-            source emirge/config/activate_env.sh
-            cd smoke_test_injection_3d
-            ./run_init.sh
-            ./run.sh
-
-
