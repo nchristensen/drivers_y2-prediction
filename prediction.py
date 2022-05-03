@@ -1812,17 +1812,17 @@ def main(ctx_factory=cl.create_some_context,
     # some utility functions
     def vol_min_loc(x):
         from grudge.op import nodal_min_loc
-        return actx.to_numpy(nodal_min_loc(discr, "vol", x))[()]
+        return actx.to_numpy(nodal_min_loc(discr, dd_vol_fluid, x))[()]
 
     def vol_max_loc(x):
         from grudge.op import nodal_max_loc
-        return actx.to_numpy(nodal_max_loc(discr, "vol", x))[()]
+        return actx.to_numpy(nodal_max_loc(discr, dd_vol_fluid, x))[()]
 
     def vol_min(x):
-        return actx.to_numpy(nodal_min(discr, "vol", x))[()]
+        return actx.to_numpy(nodal_min(discr, dd_vol_fluid, x))[()]
 
     def vol_max(x):
-        return actx.to_numpy(nodal_max(discr, "vol", x))[()]
+        return actx.to_numpy(nodal_max(discr, dd_vol_fluid, x))[()]
 
     def my_write_status(cv, dv, wall_temperature, dt, cfl_fluid, cfl_wall):
         status_msg = (f"-------- dt = {dt:1.3e},"
@@ -2030,7 +2030,7 @@ def main(ctx_factory=cl.create_some_context,
             p_max = vol_max(dv.pressure)
             logger.info(f"Pressure range violation ({p_min=}, {p_max=})")
 
-        if global_reduce(check_range_local(discr, "vol", dv.temperature,
+        if global_reduce(check_range_local(discr, dd_vol_fluid, dv.temperature,
                                      health_temp_min, health_temp_max),
                                      op="lor"):
             health_error = True
@@ -2039,7 +2039,7 @@ def main(ctx_factory=cl.create_some_context,
             logger.info(f"Temperature range violation ({t_min=}, {t_max=})")
 
         for i in range(nspecies):
-            if global_reduce(check_range_local(discr, "vol",
+            if global_reduce(check_range_local(discr, dd_vol_fluid,
                                                cv.species_mass_fractions[i],
                                          health_mass_frac_min, health_mass_frac_max),
                                          op="lor"):
