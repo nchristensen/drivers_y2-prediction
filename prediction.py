@@ -48,7 +48,7 @@ from mirgecom.logging_quantities import (
     initialize_logmgr,
     logmgr_add_cl_device_info,
     logmgr_set_time,
-    set_sim_state, logmgr_add_device_memory_usage
+    logmgr_add_device_memory_usage
 )
 
 from mirgecom.artificial_viscosity import smoothness_indicator
@@ -74,7 +74,6 @@ from mirgecom.boundary import (
 )
 from mirgecom.diffusion import DirichletDiffusionBoundary
 #from mirgecom.initializers import (Uniform, PlanarDiscontinuity)
-import cantera
 from mirgecom.eos import IdealSingleGas, PyrometheusMixture
 from mirgecom.transport import SimpleTransport
 from mirgecom.gas_model import GasModel, make_fluid_state
@@ -117,7 +116,7 @@ class SparkSource:
     """
     def __init__(self, *, dim, center=None, width=1.0,
                  amplitude=0., amplitude_func=None):
-        r"""Initialize the sponge parameters.
+        r"""Initialize the spark parameters.
 
         Parameters
         ----------
@@ -180,10 +179,6 @@ class SparkSource:
 
         return make_conserved(dim=self._dim, mass=mass, energy=energy,
                               momentum=momentum, species_mass=species_mass)
-
-
-def sponge_source(cv, cv_ref, sigma):
-    return sigma*(cv_ref - cv)
 
 
 class InitSponge:
@@ -913,7 +908,7 @@ def main(ctx_factory=cl.create_some_context,
     health_pres_min = 1.0e-1
     health_pres_max = 2.0e6
     health_temp_min = 1.0
-    health_temp_max = 5000
+    health_temp_max = 5000.
     health_mass_frac_min = -10
     health_mass_frac_max = 10
 
@@ -930,6 +925,14 @@ def main(ctx_factory=cl.create_some_context,
     spec_diff = 1.e-4
     mu_override = False  # optionally read in from input
     nspecies = 0
+    pyro_temp_iter = 3  # for pyrometheus, number of newton iterations
+    pyro_temp_tol = 1.e-4  # for pyrometheus, toleranace for temperature residual
+
+    # rhs control
+    use_ignition = False
+    use_sponge = True
+    use_av = True
+    use_combustion = True
 
     # ACTII flow properties
     total_pres_inflow = 2.745e5
@@ -1059,6 +1062,14 @@ def main(ctx_factory=cl.create_some_context,
         except KeyError:
             pass
         try:
+            pyro_temp_iter = int(input_data["pyro_temp_iter"])
+        except KeyError:
+            pass
+        try:
+            pyro_temp_tol = float(input_data["pyro_temp_tol"])
+        except KeyError:
+            pass
+        try:
             vel_sigma = float(input_data["vel_sigma"])
         except KeyError:
             pass
@@ -1103,11 +1114,23 @@ def main(ctx_factory=cl.create_some_context,
         except KeyError:
             pass
         try:
-            ignition = bool(input_data["ignition"])
+            ignition = bool(input_data["use_ignition"])
         except KeyError:
             pass
         try:
             spark_init_time = float(input_data["ignition_init_time"])
+        except KeyError:
+            pass
+        try:
+            use_sponge = bool(input_data["use_sponge"])
+        except KeyError:
+            pass
+        try:
+            use_av = bool(input_data["use_av"])
+        except KeyError:
+            pass
+        try:
+            use_combustion = bool(input_data["use_combustion"])
         except KeyError:
             pass
         try:
@@ -1231,6 +1254,10 @@ def main(ctx_factory=cl.create_some_context,
     kappa = cp*mu/Pr
     init_temperature = 300.0
 
+    # Turn off combustion unless EOS supports it
+    if nspecies < 3:
+        use_combustion = False
+
     # Averaging from https://www.azom.com/article.aspx?ArticleID=1630
     wall_insert_rho = 1625
     wall_insert_cp = 770
@@ -1284,48 +1311,43 @@ def main(ctx_factory=cl.create_some_context,
     inlet_area_ratio = inlet_height/throat_height
     outlet_area_ratio = outlet_height/throat_height
 
+    # make the eos
+    if nspecies < 3:
+        eos = IdealSingleGas(gamma=gamma, gas_const=r)
+    else:
+        from mirgecom.thermochemistry import get_pyrometheus_wrapper_class
+        from mirgecom.mechanisms.uiuc import Thermochemistry
+        pyro_mech = get_pyrometheus_wrapper_class(
+            pyro_class=Thermochemistry, temperature_niter=pyro_temp_iter)(actx.np)
+        eos = PyrometheusMixture(pyro_mech, temperature_guess=init_temperature)
+        species_names = pyro_mech.species_names
+
+    gas_model = GasModel(eos=eos, transport=transport_model)
+
     # initialize eos and species mass fractions
     y = np.zeros(nspecies)
     y_fuel = np.zeros(nspecies)
     if nspecies == 2:
         y[0] = 1
         y_fuel[1] = 1
-        species_names = ["air", "fuel"]
     elif nspecies > 2:
-        from mirgecom.mechanisms import get_mechanism_cti
-        mech_cti = get_mechanism_cti("uiuc")
+        # find name species indicies
+        for i in range(nspecies):
+            if species_names[i] == "C2H4":
+                i_c2h4 = i
+            if species_names[i] == "H2":
+                i_h2 = i
+            if species_names[i] == "O2":
+                i_ox = i
+            if species_names[i] == "N2":
+                i_di = i
 
-        cantera_soln = cantera.Solution(phase_id="gas", source=mech_cti)
-        cantera_nspecies = cantera_soln.n_species
-        if nspecies != cantera_nspecies:
-            if rank == 0:
-                print(f"specified {nspecies=}, but cantera mechanism"
-                      f" needs nspecies={cantera_nspecies}")
-            raise RuntimeError()
-
-        i_c2h4 = cantera_soln.species_index("C2H4")
-        i_h2 = cantera_soln.species_index("H2")
-        i_ox = cantera_soln.species_index("O2")
-        i_di = cantera_soln.species_index("N2")
         # Set the species mass fractions to the free-stream flow
         y[i_ox] = mf_o2
         y[i_di] = 1. - mf_o2
         # Set the species mass fractions to the free-stream flow
         y_fuel[i_c2h4] = mf_c2h4
         y_fuel[i_h2] = mf_h2
-
-        cantera_soln.TPY = init_temperature, 101325, y
-
-    # make the eos
-    if nspecies < 3:
-        eos = IdealSingleGas(gamma=gamma, gas_const=r)
-    else:
-        from mirgecom.thermochemistry import make_pyrometheus_mechanism_class
-        pyro_mech = make_pyrometheus_mechanism_class(cantera_soln)(actx.np)
-        eos = PyrometheusMixture(pyro_mech, temperature_guess=init_temperature)
-        species_names = pyro_mech.species_names
-
-    gas_model = GasModel(eos=eos, transport=transport_model)
 
     inlet_mach = getMachFromAreaRatio(area_ratio=inlet_area_ratio,
                                       gamma=gamma,
@@ -1342,9 +1364,11 @@ def main(ctx_factory=cl.create_some_context,
         sos = math.sqrt(gamma*pres_inflow/rho_inflow)
         inlet_gamma = gamma
     else:
-        cantera_soln.TPY = temp_inflow, pres_inflow, y
-        rho_inflow = cantera_soln.density
-        inlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+        rho_inflow = pyro_mech.get_density(p=pres_inflow,
+                                          temperature=temp_inflow,
+                                          mass_fractions=y)
+        inlet_gamma = (pyro_mech.get_mixture_specific_heat_cp_mass(temp_inflow, y) /
+                       pyro_mech.get_mixture_specific_heat_cv_mass(temp_inflow, y))
 
         gamma_error = (gamma - inlet_gamma)
         gamma_guess = inlet_gamma
@@ -1361,9 +1385,13 @@ def main(ctx_factory=cl.create_some_context,
             temp_inflow = getIsentropicTemperature(mach=inlet_mach,
                                                    T0=total_temp_inflow,
                                                    gamma=gamma_guess)
-            cantera_soln.TPY = temp_inflow, pres_inflow, y
-            rho_inflow = cantera_soln.density
-            inlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+
+            rho_inflow = pyro_mech.get_density(p=pres_inflow,
+                                              temperature=temp_inflow,
+                                              mass_fractions=y)
+            inlet_gamma = \
+                (pyro_mech.get_mixture_specific_heat_cp_mass(temp_inflow, y) /
+                 pyro_mech.get_mixture_specific_heat_cv_mass(temp_inflow, y))
             gamma_error = (gamma_guess - inlet_gamma)
             gamma_guess = inlet_gamma
 
@@ -1396,9 +1424,12 @@ def main(ctx_factory=cl.create_some_context,
         sos = math.sqrt(gamma*pres_outflow/rho_outflow)
         outlet_gamma = gamma
     else:
-        cantera_soln.TPY = temp_outflow, pres_outflow, y
-        rho_outflow = cantera_soln.density
-        outlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+        rho_outflow = pyro_mech.get_density(p=pres_outflow,
+                                            temperature=temp_outflow,
+                                            mass_fractions=y)
+        outlet_gamma = \
+            (pyro_mech.get_mixture_specific_heat_cp_mass(temp_outflow, y) /
+             pyro_mech.get_mixture_specific_heat_cv_mass(temp_outflow, y))
 
         gamma_error = (gamma - outlet_gamma)
         gamma_guess = outlet_gamma
@@ -1415,9 +1446,12 @@ def main(ctx_factory=cl.create_some_context,
             temp_outflow = getIsentropicTemperature(mach=outlet_mach,
                                                    T0=total_temp_inflow,
                                                    gamma=gamma_guess)
-            cantera_soln.TPY = temp_outflow, pres_outflow, y
-            rho_outflow = cantera_soln.density
-            outlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+            rho_outflow = pyro_mech.get_density(p=pres_outflow,
+                                                temperature=temp_outflow,
+                                                mass_fractions=y)
+            outlet_gamma = \
+                (pyro_mech.get_mixture_specific_heat_cp_mass(temp_outflow, y) /
+                 pyro_mech.get_mixture_specific_heat_cv_mass(temp_outflow, y))
             gamma_error = (gamma_guess - outlet_gamma)
             gamma_guess = outlet_gamma
 
@@ -1451,9 +1485,12 @@ def main(ctx_factory=cl.create_some_context,
         rho_injection = pres_injection/temp_injection/r
         sos = math.sqrt(gamma*pres_injection/rho_injection)
     else:
-        cantera_soln.TPY = temp_outflow, pres_outflow, y_fuel
-        rho_injection = cantera_soln.density
-        gamma_injection = cantera_soln.cp_mass/cantera_soln.cv_mass
+        rho_injection = pyro_mech.get_density(p=pres_injection,
+                                              temperature=temp_injection,
+                                              mass_fractions=y)
+        gamma_injection = \
+            (pyro_mech.get_mixture_specific_heat_cp_mass(temp_injection, y) /
+             pyro_mech.get_mixture_specific_heat_cv_mass(temp_injection, y))
 
         gamma_error = (gamma - gamma_injection)
         gamma_guess = gamma_injection
@@ -1470,9 +1507,12 @@ def main(ctx_factory=cl.create_some_context,
             temp_outflow = getIsentropicTemperature(mach=outlet_mach,
                                                    T0=total_temp_inj,
                                                    gamma=gamma_guess)
-            cantera_soln.TPY = temp_outflow, pres_outflow, y_fuel
-            rho_outflow = cantera_soln.density
-            outlet_gamma = cantera_soln.cp_mass/cantera_soln.cv_mass
+            rho_injection = pyro_mech.get_density(p=pres_injection,
+                                                  temperature=temp_injection,
+                                                  mass_fractions=y)
+            gamma_injection = \
+                (pyro_mech.get_mixture_specific_heat_cp_mass(temp_injection, y) /
+                 pyro_mech.get_mixture_specific_heat_cv_mass(temp_injection, y))
             gamma_error = (gamma_guess - gamma_injection)
             gamma_guess = gamma_injection
 
@@ -1625,6 +1665,14 @@ def main(ctx_factory=cl.create_some_context,
 
     create_fluid_state = actx.compile(get_fluid_state)
 
+    def get_temperature_update(cv, temperature):
+        y = cv.species_mass_fractions
+        e = gas_model.eos.internal_energy(cv)/cv.mass
+        return actx.np.abs(
+            pyro_mech.get_temperature_update_energy(e, temperature, y))
+
+    get_temperature_update_compiled = actx.compile(get_temperature_update)
+
     if restart_filename:
         if rank == 0:
             logger.info("Restarting soln.")
@@ -1697,7 +1745,6 @@ def main(ctx_factory=cl.create_some_context,
         # Set the current state from time 0
         target_cv = current_cv
 
-    # MJA: check this
     current_fluid_state = create_fluid_state(current_cv, temperature_seed)
     target_fluid_state = create_fluid_state(target_cv, temperature_seed)
     temperature_seed = current_fluid_state.temperature
@@ -1705,26 +1752,34 @@ def main(ctx_factory=cl.create_some_context,
     stepper_state = make_obj_array([current_cv, current_wall_temperature,
                                     temperature_seed])
 
-    def _ref_state_func(discr, dd_bdry, gas_model, ref_state, **kwargs):
-        from mirgecom.gas_model import project_fluid_state
-        dd_vol_fluid = dd_bdry.with_domain_tag(
-            VolumeDomainTag(dd_bdry.domain_tag.volume_tag))
+    from mirgecom.gas_model import project_fluid_state
+
+    def get_target_state_on_boundary(btag):
         return project_fluid_state(
             discr, dd_vol_fluid,
-            #as_dofdesc(dd_bdry).with_discr_tag(quadrature_tag),
-            dd_bdry,
-            ref_state, gas_model)
+            dd_vol_fluid.trace(btag),
+            target_fluid_state, gas_model
+        )
 
-    _ref_boundary_state_func = partial(_ref_state_func, ref_state=target_fluid_state)
+    flow_ref_state = \
+        get_target_state_on_boundary("flow")
 
-    ref_state = PrescribedFluidBoundary(boundary_state_func=_ref_boundary_state_func)
+    flow_ref_state = thaw(freeze(flow_ref_state, actx), actx)
+
+    def _target_flow_state_func(**kwargs):
+        return flow_ref_state
+
+    flow_boundary = PrescribedFluidBoundary(
+        boundary_state_func=_target_flow_state_func)
+
     isothermal_wall = IsothermalWallBoundary(temp_wall)
     wall_farfield = DirichletDiffusionBoundary(temp_wall)
 
     fluid_boundaries = {
-        dd_vol_fluid.trace("inflow").domain_tag: ref_state,
-        dd_vol_fluid.trace("outflow").domain_tag: ref_state,
-        dd_vol_fluid.trace("injection").domain_tag: ref_state,
+        #dd_vol_fluid.trace("inflow").domain_tag: ref_state,
+        #dd_vol_fluid.trace("outflow").domain_tag: ref_state,
+        #dd_vol_fluid.trace("injection").domain_tag: ref_state,
+        dd_vol_fluid.trace("flow").domain_tag: flow_boundary,
         dd_vol_fluid.trace("isothermal_wall").domain_tag: isothermal_wall,
     }
 
@@ -1757,7 +1812,16 @@ def main(ctx_factory=cl.create_some_context,
     sponge_init = InitSponge(x0=sponge_x0, thickness=sponge_thickness,
                              amplitude=sponge_amp)
     x_vec = thaw(discr.nodes(dd_vol_fluid), actx)
-    sponge_sigma = sponge_init(x_vec=x_vec)
+
+    def _sponge_sigma(x_vec):
+        return sponge_init(x_vec=x_vec)
+
+    get_sponge_sigma = actx.compile(_sponge_sigma)
+    sponge_sigma = get_sponge_sigma(x_vec)
+
+    def _sponge_source(cv):
+        """Create sponge source."""
+        return sponge_sigma*(current_fluid_state.cv - cv)
 
     wall_model = WallModel(
         density=(
@@ -1809,39 +1873,48 @@ def main(ctx_factory=cl.create_some_context,
         logger.info(init_message)
 
     # some utility functions
-    def vol_min_loc(x):
+    def vol_min_loc(dd_vol, x):
         from grudge.op import nodal_min_loc
-        return actx.to_numpy(nodal_min_loc(discr, dd_vol_fluid, x))[()]
+        return actx.to_numpy(nodal_min_loc(discr, dd_vol, x,
+                                           initial=np.inf))[()]
 
-    def vol_max_loc(x):
+    def vol_max_loc(dd_vol, x):
         from grudge.op import nodal_max_loc
-        return actx.to_numpy(nodal_max_loc(discr, dd_vol_fluid, x))[()]
+        return actx.to_numpy(nodal_max_loc(discr, dd_vol, x,
+                                           initial=-np.inf))[()]
 
-    def vol_min(x):
-        return actx.to_numpy(nodal_min(discr, dd_vol_fluid, x))[()]
+    def vol_min(dd_vol, x):
+        return actx.to_numpy(nodal_min(discr, dd_vol, x,
+                                       initial=np.inf))[()]
 
-    def vol_max(x):
-        return actx.to_numpy(nodal_max(discr, dd_vol_fluid, x))[()]
+    def vol_max(dd_vol, x):
+        return actx.to_numpy(nodal_max(discr, dd_vol, x,
+                                       initial=-np.inf))[()]
+
+    def global_range_check(dd_vol, array, min_val, max_val):
+        return global_reduce(
+            check_range_local(
+                discr, dd_vol, array, min_val, max_val), op="lor")
 
     def my_write_status(cv, dv, wall_temperature, dt, cfl_fluid, cfl_wall):
         status_msg = (f"-------- dt = {dt:1.3e},"
                       f" cfl_fluid = {cfl_fluid:1.4f}"
                       f" cfl_wall = {cfl_wall:1.4f}")
-        temperature = thaw(freeze(dv.temperature, actx), actx)
-        pressure = thaw(freeze(dv.pressure, actx), actx)
-        wall_temp = thaw(freeze(wall_temperature, actx), actx)
+        #temperature = thaw(freeze(dv.temperature, actx), actx)
+        #pressure = thaw(freeze(dv.pressure, actx), actx)
+        #wall_temp = thaw(freeze(wall_temperature, actx), actx)
 
-        pmin = vol_min(pressure)
-        pmax = vol_max(pressure)
-        tmin = vol_min(temperature)
-        tmax = vol_max(temperature)
-        twmin = vol_min(wall_temp)
-        twmax = vol_max(wall_temp)
+        pmin = vol_min(dd_vol_fluid, dv.pressure)
+        pmax = vol_max(dd_vol_fluid, dv.pressure)
+        tmin = vol_min(dd_vol_fluid, dv.temperature)
+        tmax = vol_max(dd_vol_fluid, dv.temperature)
+        twmin = vol_min(dd_vol_wall, wall_temperature)
+        twmax = vol_max(dd_vol_wall, wall_temperature)
 
         from pytools.obj_array import obj_array_vectorize
-        y_min = obj_array_vectorize(lambda x: vol_min(x),
+        y_min = obj_array_vectorize(lambda x: vol_min(dd_vol_fluid, x),
                                       cv.species_mass_fractions)
-        y_max = obj_array_vectorize(lambda x: vol_max(x),
+        y_max = obj_array_vectorize(lambda x: vol_max(dd_vol_fluid, x),
                                       cv.species_mass_fractions)
 
         dv_status_msg = (
@@ -1850,6 +1923,19 @@ def main(ctx_factory=cl.create_some_context,
             f"\n-------- T_fluid (min, max) (K)  = ({tmin:7g}, {tmax:7g})")
         dv_status_msg += (
             f"\n-------- T_wall (min, max) (K)  = ({twmin:7g}, {twmax:7g})")
+
+        if nspecies > 2:
+            # check the temperature convergence
+            # a single call to get_temperature_update is like taking an additional
+            # Newton iteration and gives us a residual
+            temp_resid = get_temperature_update_compiled(
+                cv, dv.temperature)/dv.temperature
+            temp_err_min = vol_min(dd_vol_fluid, temp_resid)
+            temp_err_max = vol_max(dd_vol_fluid, temp_resid)
+            dv_status_msg += (
+                f"\n-------- T_resid (min, max) = "
+                f"({temp_err_min:1.5e}, {temp_err_max:1.5e})")
+
         for i in range(nspecies):
             dv_status_msg += (
                 f"\n-------- y_{species_names[i]} (min, max) = "
@@ -1893,9 +1979,6 @@ def main(ctx_factory=cl.create_some_context,
             ("temperature", wall_temperature),
             ("dt" if constant_cfl else "cfl", ts_field_wall)]
 
-        #print(f"{fluid_viz_fields=}")
-        #print(f"{wall_viz_fields=}")
-
         # extra viz quantities, things here are often used for post-processing
         if viz_level > 0:
             mach = cv.speed / dv.speed_of_sound
@@ -1912,6 +1995,12 @@ def main(ctx_factory=cl.create_some_context,
             fluid_viz_fields.extend(
                 ("Y_"+species_names[i], cv.species_mass_fractions[i])
                 for i in range(nspecies))
+
+            if nspecies > 2:
+                temp_resid = get_temperature_update_compiled(
+                    cv, dv.temperature)/dv.temperature
+                fluid_viz_ext = [("temp_resid", temp_resid)]
+                fluid_viz_fields.extend(fluid_viz_ext)
 
         # additional viz quantities, add in some non-dimensional numbers
         if viz_level > 1:
@@ -2014,39 +2103,55 @@ def main(ctx_factory=cl.create_some_context,
         if rank == 0:
             print("******** Done Writing Restart File ********\n")
 
-    def my_health_check(cv, dv):
+    def my_health_check(fluid_state):
         # FIXME: Add health check for wall temperature?
         health_error = False
+        cv = fluid_state.cv
+        dv = fluid_state.dv
+
         if check_naninf_local(discr, dd_vol_fluid, dv.pressure):
             health_error = True
             logger.info(f"{rank=}: NANs/Infs in pressure data.")
 
-        if global_reduce(check_range_local(discr, dd_vol_fluid, dv.pressure,
-                                     health_pres_min, health_pres_max),
-                                     op="lor"):
+        if global_range_check(dd_vol_fluid, dv.pressure,
+                              health_pres_min, health_pres_max):
             health_error = True
-            p_min = vol_min(dv.pressure)
-            p_max = vol_max(dv.pressure)
-            logger.info(f"Pressure range violation ({p_min=}, {p_max=})")
+            p_min = vol_min(dd_vol_fluid, dv.pressure)
+            p_max = vol_max(dd_vol_fluid, dv.pressure)
+            logger.info(f"Pressure range violation: "
+                        f"Simulation Range ({p_min=}, {p_max=}) "
+                        f"Specified Limits ({health_pres_min=}, {health_pres_max=})")
 
-        if global_reduce(check_range_local(discr, dd_vol_fluid, dv.temperature,
-                                     health_temp_min, health_temp_max),
-                                     op="lor"):
+        if global_range_check(dd_vol_fluid, dv.temperature,
+                              health_temp_min, health_temp_max):
             health_error = True
-            t_min = vol_min(dv.temperature)
-            t_max = vol_max(dv.temperature)
-            logger.info(f"Temperature range violation ({t_min=}, {t_max=})")
+            t_min = vol_min(dd_vol_fluid, dv.temperature)
+            t_max = vol_max(dd_vol_fluid, dv.temperature)
+            logger.info(f"Temperature range violation: "
+                        f"Simulation Range ({t_min=}, {t_max=}) "
+                        f"Specified Limits ({health_temp_min=}, {health_temp_max=})")
 
         for i in range(nspecies):
-            if global_reduce(check_range_local(discr, dd_vol_fluid,
-                                               cv.species_mass_fractions[i],
-                                         health_mass_frac_min, health_mass_frac_max),
-                                         op="lor"):
+            if global_range_check(dd_vol_fluid, cv.species_mass_fractions[i],
+                                  health_mass_frac_min, health_mass_frac_max):
                 health_error = True
-                y_min = vol_min(cv.species_mass_fractions[i])
-                y_max = vol_max(cv.species_mass_fractions[i])
+                y_min = vol_min(dd_vol_fluid, cv.species_mass_fractions[i])
+                y_max = vol_max(dd_vol_fluid, cv.species_mass_fractions[i])
                 logger.info(f"Species mass fraction range violation. "
                             f"{species_names[i]}: ({y_min=}, {y_max=})")
+
+        if nspecies > 2:
+            # check the temperature convergence
+            # a single call to get_temperature_update is like taking an additional
+            # Newton iteration and gives us a residual
+            temp_resid = get_temperature_update_compiled(
+                cv, dv.temperature)/dv.temperature
+            temp_err = vol_max(dd_vol_fluid, temp_resid)
+            if temp_err > pyro_temp_tol:
+                health_error = True
+                #error = thaw(freeze(temp_err, actx), actx)
+                logger.info(f"Temperature is not converged "
+                            f"{temp_err=} > {pyro_temp_tol}.")
 
         return health_error
 
@@ -2148,13 +2253,13 @@ def main(ctx_factory=cl.create_some_context,
             ts_field = cfl*my_get_wall_timestep(
                 discr=discr, wall_state=wall_state, wall_model=wall_model)
             mydt = wall_state.array_context.to_numpy(nodal_min(
-                    discr, wall_volume_dd, ts_field))[()]
+                    discr, wall_volume_dd, ts_field, initial=np.inf))[()]
         else:
             from grudge.op import nodal_max
             ts_field = mydt/my_get_wall_timestep(
                 discr=discr, wall_state=wall_state, wall_model=wall_model)
             cfl = wall_state.array_context.to_numpy(nodal_max(
-                    discr, wall_volume_dd, ts_field))[()]
+                    discr, wall_volume_dd, ts_field, initial=0.))[()]
 
         return ts_field, cfl, mydt
 
@@ -2213,13 +2318,13 @@ def main(ctx_factory=cl.create_some_context,
             ts_field = cfl*my_get_viscous_timestep(
                 discr=discr, fluid_state=fluid_state, alpha=alpha)
             mydt = fluid_state.array_context.to_numpy(nodal_min(
-                    discr, fluid_volume_dd, ts_field))[()]
+                    discr, fluid_volume_dd, ts_field, initial=np.inf))[()]
         else:
             from grudge.op import nodal_max
             ts_field = mydt/my_get_viscous_timestep(
                 discr=discr, fluid_state=fluid_state, alpha=alpha)
             cfl = fluid_state.array_context.to_numpy(nodal_max(
-                    discr, fluid_volume_dd, ts_field))[()]
+                    discr, fluid_volume_dd, ts_field, initial=0.))[()]
 
         return ts_field, cfl, mydt
 
@@ -2228,16 +2333,15 @@ def main(ctx_factory=cl.create_some_context,
 
     def my_get_alpha(discr, fluid_state, alpha):
         """ Scale alpha by the element characteristic length """
-
-        #from mirgecom.fluid import compute_wavespeed
-        #wavespeed = compute_wavespeed(eos, fluid_state)
-
-        #alpha_field = alpha*wavespeed*length_scales
         alpha_field = alpha*fluid_state.speed*char_length
-        #alpha_field = wavespeed*0 + alpha*current_step
-        #alpha_field = state.mass
-
         return alpha_field
+
+    """
+    def get_sc_scale():
+        return alpha_sc * char_length
+
+    get_sc_scale_compiled = actx.compile(get_sc_scale)
+    """
 
     def _check_time(time, dt, interval, interval_type):
         toler = 1.e-6
@@ -2278,6 +2382,7 @@ def main(ctx_factory=cl.create_some_context,
     def my_pre_step(step, t, dt, state):
         cv, wall_temperature, tseed = state
         fluid_state = create_fluid_state(cv=cv, temperature_seed=tseed)
+        fluid_state = thaw(freeze(fluid_state, actx), actx)
         dv = fluid_state.dv
 
         try:
@@ -2339,7 +2444,7 @@ def main(ctx_factory=cl.create_some_context,
             do_status = check_step(step=step, interval=nstatus)
 
             if do_health:
-                health_errors = global_reduce(my_health_check(cv, dv), op="lor")
+                health_errors = global_reduce(my_health_check(fluid_state), op="lor")
                 if health_errors:
                     if rank == 0:
                         logger.warning("Fluid solution failed health check.")
@@ -2381,11 +2486,8 @@ def main(ctx_factory=cl.create_some_context,
         return state, dt
 
     def my_post_step(step, t, dt, state):
-        # Logmgr needs to know about EOS, dt, dim?
-        # imo this is a design/scope flaw
         if logmgr:
             set_dt(logmgr, dt)
-            set_sim_state(logmgr, dim, state[0], eos)
             logmgr.tick_after()
         return state, dt
 
@@ -2393,15 +2495,31 @@ def main(ctx_factory=cl.create_some_context,
         cv, wall_temperature, tseed = state
         fluid_state = make_fluid_state(cv=cv, gas_model=gas_model,
                                        temperature_seed=tseed)
+
+        # Temperature seed RHS (keep tseed updated)
+        tseed_rhs = fluid_state.temperature - tseed
+
+        """
+        # Steps common to NS and AV (and wall model needs grad(temperature))
+        operator_fluid_states = make_operator_fluid_states(
+            discr, fluid_state, gas_model, boundaries, quadrature_tag)
+
+        grad_fluid_cv = grad_cv_operator(
+            discr, gas_model, boundaries, fluid_state,
+            quadrature_tag=quadrature_tag,
+            operator_states_quad=operator_fluid_states)
+        """
+
         alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
-        fluid_rhs, wall_rhs = coupled_ns_heat_operator(
+
+        ns_rhs, wall_rhs = coupled_ns_heat_operator(
             discr,
             gas_model, wall_model,
             dd_vol_fluid, dd_vol_wall,
             fluid_boundaries, wall_boundaries,
             fluid_state, wall_temperature,
             time=t,
-            use_av=False,
+            use_av=use_av,
             av_kwargs={
                 "alpha": alpha_field,
                 "s0": s0_sc,
@@ -2412,17 +2530,21 @@ def main(ctx_factory=cl.create_some_context,
             wall_time_scale=wall_time_scale, wall_penalty_amount=wall_penalty_amount,
             quadrature_tag=quadrature_tag)
 
-        fluid_rhs += sponge_source(cv=fluid_state.cv, cv_ref=target_cv,
-                         sigma=sponge_sigma)
+        chem_rhs = 0*cv
+        if use_combustion:  # conditionals evaluated only once at compile time
+            chem_rhs =  \
+                eos.get_species_source_terms(cv, temperature=fluid_state.temperature)
 
-        if nspecies > 3:
-            fluid_rhs += eos.get_species_source_terms(cv,
-                             temperature=fluid_state.temperature)
+        ignition_rhs = 0*cv
+        if use_ignition:
+            ignition_rhs = ignition_source(x_vec=x_vec, cv=cv, time=t)
 
-        if ignition:
-            fluid_rhs += ignition_source(x_vec=x_vec, cv=cv, time=t)
+        sponge_rhs = 0*cv
+        if use_sponge:
+            sponge_rhs = _sponge_source(cv=cv)
 
-        tseed_rhs = fluid_state.temperature - temperature_seed
+        fluid_rhs = ns_rhs + chem_rhs + sponge_rhs + ignition_rhs
+
         return make_obj_array([fluid_rhs, wall_rhs, tseed_rhs])
 
     current_step, current_t, stepper_state = \

@@ -2,7 +2,7 @@
 
 # default branch for building mirgecom for this driver
 mirge_fork="majosm"
-mirge_branch="multiphysics-production"
+mirge_branch="multiphysics-production-fusion"
 # conda environment name
 conda_env="mirgeDriver.Y2prediction"
 

@@ -670,6 +670,7 @@ Physical Surface('wall_surround') = {3};
 Physical Curve('inflow') = {-l_inlet};
 Physical Curve('outflow') = {l_outlet};
 Physical Curve('injection') = {l_injector_inlet};
+Physical Curve('flow') = {-l_inlet, l_outlet, l_injector_inlet};
 Physical Curve('isothermal_wall') = {
 l_nozzle_top,
 l_nozzle_bottom,
