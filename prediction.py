@@ -23,6 +23,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
+import os
 import logging
 import sys
 import yaml
@@ -82,7 +83,10 @@ from mirgecom.multiphysics.thermally_coupled_fluid_wall import (
     coupled_grad_t_operator,
     coupled_ns_heat_operator
 )
-
+# lassen
+# os.environ["PYOPENCL_CTX"] = "0:0"
+# ICC
+os.environ["PYOPENCL_CTX"] = "0"
 
 class SingleLevelFilter(logging.Filter):
     def __init__(self, passlevel, reject):
@@ -1316,7 +1320,7 @@ def main(ctx_factory=cl.create_some_context,
         eos = IdealSingleGas(gamma=gamma, gas_const=r)
     else:
         from mirgecom.thermochemistry import get_pyrometheus_wrapper_class
-        from uiuc import Thermochemistry
+        from mirgecom.mechanisms.uiuc import Thermochemistry
         pyro_mech = get_pyrometheus_wrapper_class(
             pyro_class=Thermochemistry, temperature_niter=pyro_temp_iter)(actx.np)
         eos = PyrometheusMixture(pyro_mech, temperature_guess=init_temperature)
