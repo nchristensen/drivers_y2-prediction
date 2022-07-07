@@ -88,6 +88,7 @@ from mirgecom.multiphysics.thermally_coupled_fluid_wall import (
 # ICC
 os.environ["PYOPENCL_CTX"] = "0"
 
+
 class SingleLevelFilter(logging.Filter):
     def __init__(self, passlevel, reject):
         self.passlevel = passlevel
