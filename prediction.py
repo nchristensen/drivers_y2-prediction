@@ -34,7 +34,6 @@ import math
 from pytools.obj_array import make_obj_array
 from functools import partial
 
-from arraycontext import thaw, freeze
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from meshmode.dof_array import DOFArray
 from grudge.eager import EagerDGDiscretization
@@ -57,7 +56,8 @@ from mirgecom.simutil import (
     distribute_mesh,
     write_visfile,
     check_naninf_local,
-    check_range_local
+    check_range_local,
+    force_evaluation
 )
 from mirgecom.restart import write_restart_file
 from mirgecom.io import make_init_message
@@ -65,6 +65,7 @@ from mirgecom.mpi import mpi_entry_point
 import pyopencl.tools as cl_tools
 from mirgecom.integrators import (rk4_step, lsrk54_step, lsrk144_step,
                                   euler_step)
+from grudge.shortcuts import compiled_lsrk45_step
 
 from mirgecom.fluid import make_conserved
 from mirgecom.steppers import advance_state
@@ -903,6 +904,7 @@ def main(ctx_factory=cl.create_some_context,
     current_cfl = 1.0
     constant_cfl = False
     last_viz_interval = 0
+    force_eval = True
 
     # default health status bounds
     health_pres_min = 1.0e-1
@@ -933,6 +935,8 @@ def main(ctx_factory=cl.create_some_context,
     use_sponge = True
     use_av = True
     use_combustion = True
+
+    sponge_sigma = 1.0
 
     # ACTII flow properties
     total_pres_inflow = 2.745e5
@@ -1126,6 +1130,10 @@ def main(ctx_factory=cl.create_some_context,
         except KeyError:
             pass
         try:
+            sponge_sigma = float(input_data["sponge_sigma"])
+        except KeyError:
+            pass
+        try:
             use_av = bool(input_data["use_av"])
         except KeyError:
             pass
@@ -1143,10 +1151,14 @@ def main(ctx_factory=cl.create_some_context,
             pass
 
     # param sanity check
-    allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144"]
+    allowed_integrators = ["rk4", "euler", "lsrk54", "lsrk144", "compiled_lsrk54"]
     if integrator not in allowed_integrators:
         error_message = "Invalid time integrator: {}".format(integrator)
         raise RuntimeError(error_message)
+
+    if integrator == "compiled_lsrk54":
+        print("Setting force_eval = False for pre-compiled time integration")
+        force_eval = False
 
     if viz_interval_type > 2:
         error_message = "Invalid value for viz_interval_type [0-2]"
@@ -1213,6 +1225,9 @@ def main(ctx_factory=cl.create_some_context,
         print(f"ignition duration {spark_duration}")
         print("#### Ignition control parameters ####\n")
 
+    def _compiled_stepper_wrapper(state, t, dt, rhs):
+        return compiled_lsrk45_step(actx, state, t, dt, rhs)
+
     timestepper = rk4_step
     if integrator == "euler":
         timestepper = euler_step
@@ -1220,6 +1235,8 @@ def main(ctx_factory=cl.create_some_context,
         timestepper = lsrk54_step
     if integrator == "lsrk144":
         timestepper = lsrk144_step
+    if integrator == "compiled_lsrk54":
+        timestepper = _compiled_stepper_wrapper
 
     # }}}
     # working gas: O2/N2 #
@@ -1314,6 +1331,7 @@ def main(ctx_factory=cl.create_some_context,
     # make the eos
     if nspecies < 3:
         eos = IdealSingleGas(gamma=gamma, gas_const=r)
+        species_names = ["air", "fuel"]
     else:
         from mirgecom.thermochemistry import get_pyrometheus_wrapper_class
         from uiuc import Thermochemistry
@@ -1710,7 +1728,8 @@ def main(ctx_factory=cl.create_some_context,
         if rank == 0:
             logger.info("Initializing soln.")
         current_cv = bulk_init(
-            discr=discr, x_vec=thaw(discr.nodes(dd_vol_fluid), actx), eos=eos,
+            #discr=discr, x_vec=thaw(discr.nodes(dd_vol_fluid), actx), eos=eos,
+            discr=discr, x_vec=actx.thaw(discr.nodes(dd_vol_fluid)), eos=eos,
             time=0)
         current_wall_temperature = temp_wall * (0*wall_insert_mask + 1)
         temperature_seed = init_temperature
@@ -1764,7 +1783,7 @@ def main(ctx_factory=cl.create_some_context,
     flow_ref_state = \
         get_target_state_on_boundary("flow")
 
-    flow_ref_state = thaw(freeze(flow_ref_state, actx), actx)
+    flow_ref_state = force_evaluation(actx, flow_ref_state)
 
     def _target_flow_state_func(**kwargs):
         return flow_ref_state
@@ -1806,12 +1825,12 @@ def main(ctx_factory=cl.create_some_context,
 
     # initialize the sponge field
     sponge_thickness = 0.09
-    sponge_amp = 1.0/current_dt/1000
+    sponge_amp = sponge_sigma/current_dt/1000
     sponge_x0 = 0.9
 
     sponge_init = InitSponge(x0=sponge_x0, thickness=sponge_thickness,
                              amplitude=sponge_amp)
-    x_vec = thaw(discr.nodes(dd_vol_fluid), actx)
+    x_vec = actx.thaw(discr.nodes(dd_vol_fluid))
 
     def _sponge_sigma(x_vec):
         return sponge_init(x_vec=x_vec)
@@ -1848,7 +1867,13 @@ def main(ctx_factory=cl.create_some_context,
         ])
 
         try:
-            logmgr.add_watches(["memory_usage.max"])
+            logmgr.add_watches(["memory_usage_python.max"])
+            #logmgr.add_watches(["memory_usage_python.max", "memory: {value}"])
+        except KeyError:
+            pass
+
+        try:
+            logmgr.add_watches(["memory_usage_gpu.max"])
         except KeyError:
             pass
 
@@ -1989,6 +2014,7 @@ def main(ctx_factory=cl.create_some_context,
             fluid_viz_ext = [("mach", mach),
                        ("velocity", cv.velocity),
                        ("alpha", alpha_field),
+                       ("rank", rank),
                        ("tagged_cells", tagged_cells)]
             fluid_viz_fields.extend(fluid_viz_ext)
             # species mass fractions
@@ -2070,10 +2096,12 @@ def main(ctx_factory=cl.create_some_context,
 
         write_visfile(
             discr, fluid_viz_fields, fluid_visualizer,
-            vizname=vizname+"-fluid", step=dump_number, t=t, overwrite=True)
+            vizname=vizname+"-fluid", step=dump_number, t=t,
+            overwrite=True, comm=comm)
         write_visfile(
             discr, wall_viz_fields, wall_visualizer,
-            vizname=vizname+"-wall", step=dump_number, t=t, overwrite=True)
+            vizname=vizname+"-wall", step=dump_number, t=t,
+            overwrite=True, comm=comm)
 
         if rank == 0:
             print("******** Done Writing Visualization File ********\n")
@@ -2377,32 +2405,45 @@ def main(ctx_factory=cl.create_some_context,
 
         return status, dt, dumps_so_far + last_viz_interval
 
-    check_time = _check_time
+    #check_time = _check_time
 
     def my_pre_step(step, t, dt, state):
-        cv, wall_temperature, tseed = state
-        fluid_state = create_fluid_state(cv=cv, temperature_seed=tseed)
-        fluid_state = thaw(freeze(fluid_state, actx), actx)
-        dv = fluid_state.dv
 
         try:
 
             if logmgr:
                 logmgr.tick_before()
 
-            alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+            # disable non-constant dt timestepping for now
+            # re-enable when we're ready
 
-            ts_field_fluid, cfl_fluid, dt_fluid = my_get_timestep(
-                discr=discr, fluid_state=fluid_state, alpha=alpha_field,
-                t=t, dt=dt, cfl=current_cfl, t_final=t_final,
-                constant_cfl=constant_cfl, fluid_volume_dd=dd_vol_fluid)
+            do_viz = check_step(step=step, interval=nviz)
+            do_restart = check_step(step=step, interval=nrestart)
+            do_health = check_step(step=step, interval=nhealth)
+            do_status = check_step(step=step, interval=nstatus)
+            next_dump_number = step
 
-            ts_field_wall, cfl_wall, dt_wall = my_get_timestep_wall(
-                discr=discr, wall_state=wall_temperature,
-                wall_model=wall_model,
-                t=t, dt=dt, cfl=current_cfl, t_final=t_final,
-                constant_cfl=constant_cfl, wall_volume_dd=dd_vol_wall)
+            if any([do_viz, do_restart, do_health, do_status]):
+                cv, wall_temperature, tseed = state
+                fluid_state = create_fluid_state(cv=cv, temperature_seed=tseed)
+                if not force_eval:
+                    fluid_state = force_evaluation(actx, fluid_state)
+                dv = fluid_state.dv
 
+                alpha_field = my_get_alpha(discr, fluid_state, alpha_sc)
+
+                ts_field_fluid, cfl_fluid, dt_fluid = my_get_timestep(
+                    discr=discr, fluid_state=fluid_state, alpha=alpha_field,
+                    t=t, dt=dt, cfl=current_cfl, t_final=t_final,
+                    constant_cfl=constant_cfl, fluid_volume_dd=dd_vol_fluid)
+
+                ts_field_wall, cfl_wall, dt_wall = my_get_timestep_wall(
+                    discr=discr, wall_state=wall_temperature,
+                    wall_model=wall_model,
+                    t=t, dt=dt, cfl=current_cfl, t_final=t_final,
+                    constant_cfl=constant_cfl, wall_volume_dd=dd_vol_wall)
+
+            """
             # adjust time for constant cfl, use the smallest timescale
             dt_const_cfl = 100.
             if constant_cfl:
@@ -2438,10 +2479,7 @@ def main(ctx_factory=cl.create_some_context,
             else:
                 do_viz = check_step(step=step, interval=nviz)
                 next_dump_number = step
-
-            do_restart = check_step(step=step, interval=nrestart)
-            do_health = check_step(step=step, interval=nhealth)
-            do_status = check_step(step=step, interval=nstatus)
+            """
 
             if do_health:
                 health_errors = global_reduce(my_health_check(fluid_state), op="lor")
@@ -2553,7 +2591,7 @@ def main(ctx_factory=cl.create_some_context,
                       post_step_callback=my_post_step,
                       istep=current_step, dt=current_dt,
                       t=current_t, t_final=t_final,
-                      #state=current_state)
+                      force_eval=force_eval,
                       state=stepper_state)
     current_cv, current_wall_temperature, tseed = stepper_state
     current_fluid_state = create_fluid_state(current_cv, tseed)
