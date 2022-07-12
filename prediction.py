@@ -2072,12 +2072,12 @@ def main(ctx_factory=cl.create_some_context,
             viz_ext = [("grad_temperature", wall_grad_temperature)]
             wall_viz_fields.extend(viz_ext)
 
-        write_visfile(
-            discr, fluid_viz_fields, fluid_visualizer,
-            vizname=vizname+"-fluid", step=dump_number, t=t, overwrite=True)
-        write_visfile(
-            discr, wall_viz_fields, wall_visualizer,
-            vizname=vizname+"-wall", step=dump_number, t=t, overwrite=True)
+        #write_visfile(
+        #    discr, fluid_viz_fields, fluid_visualizer,
+        #    vizname=vizname+"-fluid", step=dump_number, t=t, overwrite=True)
+        #write_visfile(
+        #    discr, wall_viz_fields, wall_visualizer,
+        #    vizname=vizname+"-wall", step=dump_number, t=t, overwrite=True)
 
         if rank == 0:
             print("******** Done Writing Visualization File ********\n")
@@ -2102,7 +2102,7 @@ def main(ctx_factory=cl.create_some_context,
                 "global_nelements": global_nelements,
                 "num_parts": nparts
             }
-            write_restart_file(actx, restart_data, restart_fname, comm)
+            #write_restart_file(actx, restart_data, restart_fname, comm)
 
         if rank == 0:
             print("******** Done Writing Restart File ********\n")
