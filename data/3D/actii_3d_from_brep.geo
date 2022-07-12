@@ -47,6 +47,24 @@ Else
     injector_factor=5.0;
 EndIf
 
+If(Exists(shearfac))
+    shear_factor=shearfac;
+Else
+    shear_factor=1.0;
+EndIf
+
+If(Exists(isofac))
+    iso_factor=isofac;
+Else
+    iso_factor=1.0;
+EndIf
+
+If(Exists(cavityfac))
+    cavity_factor=cavityfac;
+Else
+    cavity_factor=1.0;
+EndIf
+
 // horizontal injection
 cavityAngle=45;
 inj_h=4.;  // height of injector (bottom) from floor
@@ -55,17 +73,19 @@ inj_l = 20; // length of injector
 
 bigsize = basesize*4;     // the biggest mesh size 
 inletsize = basesize*2;   // background mesh size upstream of the nozzle
-isosize = basesize;       // background mesh size in the isolator
-nozzlesize = basesize/2;       // background mesh size in the isolator
-cavitysize = basesize/2.; // background mesh size in the cavity region
+isosize = basesize/iso_factor;       // background mesh size in the isolator
+nozzlesize = basesize/12;       // background mesh size in the nozzle
+cavitysize = basesize/cavity_factor; // background mesh size in the cavity region
+shearsize = isosize/shear_factor; // background mesh size in the shear region
 samplesize = basesize/2;       // background mesh size in the sample
-injectorsize = inj_d/injector_factor; // background mesh size in the cavity region
+injectorsize = inj_d/injector_factor; // background mesh size in the injector region
 
 Printf("basesize = %f", basesize);
 Printf("inletsize = %f", inletsize);
 Printf("isosize = %f", isosize);
 Printf("nozzlesize = %f", nozzlesize);
 Printf("cavitysize = %f", cavitysize);
+Printf("shearsize = %f", shearsize);
 Printf("injectorsize = %f", injectorsize);
 Printf("samplesize = %f", samplesize);
 Printf("boundratio = %f", boundratio);
@@ -111,10 +131,10 @@ Field[1].Sampling = 1000;
 //Create threshold field that varrries element size near boundaries
 Field[2] = Threshold;
 Field[2].InField = 1;
-Field[2].SizeMin = nozzlesize / boundratio;
+Field[2].SizeMin = isosize / boundratio;
 Field[2].SizeMax = isosize;
 Field[2].DistMin = 0.02;
-Field[2].DistMax = 5;
+Field[2].DistMax = 10;
 Field[2].StopAtDistMax = 1;
 //
 // Create distance field from curves, cavity only
@@ -126,13 +146,13 @@ Field[11].SurfacesList = {
 };
 Field[11].Sampling = 1000;
 
-//Create threshold field that varrries element size near boundaries
+//Create threshold field that varies element size near boundaries
 Field[12] = Threshold;
 Field[12].InField = 11;
 Field[12].SizeMin = cavitysize / boundratiocavity;
 Field[12].SizeMax = cavitysize;
 Field[12].DistMin = 0.02;
-Field[12].DistMax = 5;
+Field[12].DistMax = 10;
 Field[12].StopAtDistMax = 1;
 
 // Create distance field from curves, injector only
@@ -148,7 +168,7 @@ Field[14].InField = 13;
 Field[14].SizeMin = injectorsize / boundratioinjector;
 Field[14].SizeMax = injectorsize;
 Field[14].DistMin = 0.001;
-Field[14].DistMax = 0.5;
+Field[14].DistMax = 1.0;
 Field[14].StopAtDistMax = 1;
 
 // Create distance field from curves, inside wall only
@@ -229,7 +249,7 @@ Field[6] = Box;
 Field[6].XMin = cavity_start;
 Field[6].XMax = cavity_end;
 Field[6].YMin = -1000.0;
-Field[6].YMax = -3;
+Field[6].YMax = 0.;
 Field[6].ZMin = -1000.0;
 Field[6].ZMax = 1000.0;
 Field[6].Thickness = 100;    // interpolate from VIn to Vout over a distance around the box
@@ -266,6 +286,24 @@ Field[8].VolumesList = {1,2};
 Field[8].VIn = samplesize;
 Field[8].VOut = bigsize;
 
+// background mesh size in the shear region
+shear_start_x = 0.65*1000;
+shear_end_x = 0.73*1000;
+shear_start_y = -0.004*1000;
+shear_end_y = -0.01*1000;
+shear_start_z = -1000.0;
+shear_end_z = 1000.0;
+Field[9] = Box;
+Field[9].XMin = shear_start_x;
+Field[9].XMax = shear_end_x;
+Field[9].YMin = shear_start_y;
+Field[9].YMax = shear_end_y;
+Field[9].ZMin = shear_start_z;
+Field[9].ZMax = shear_end_z;
+Field[9].Thickness = 100;
+Field[9].VIn = shearsize;
+Field[9].VOut = bigsize;
+
 // keep the injector boundary spacing in the fluid mesh only
 Field[20] = Restrict;
 Field[20].VolumesList = {3};
@@ -279,13 +317,20 @@ Field[21].InField = 7;
 Field[100] = Min;
 //Field[100].FieldsList = {2, 3, 4, 5, 6, 7, 12, 14};
 //Field[100].FieldsList = {2, 3, 4, 5, 6, 7, 8, 12, 14, 16, 18, 20, 21};
-Field[100].FieldsList = {2, 3, 4, 5, 6, 8, 12, 16, 18, 20, 21};
-//Field[100].FieldsList = {2};
+Field[100].FieldsList = {2, 3, 4, 5, 6, 8, 9, 12, 16, 18, 20, 21};
 Background Field = 100;
 
 Mesh.MeshSizeExtendFromBoundary = 0;
 Mesh.MeshSizeFromPoints = 0;
 Mesh.MeshSizeFromCurvature = 0;
 
-//Mesh.CharacteristicLengthMax = basesize;
 
+// Delaunay, seems to respect changing mesh sizes better
+// Mesh.Algorithm3D = 1;
+// Frontal, makes a better looking mesh, will make bigger elements where I don't want them though
+// Doesn't repsect the mesh sizing parameters ...
+//Mesh.Algorithm3D = 4;
+// HXT, re-implemented Delaunay in parallel
+Mesh.Algorithm3D = 10;
+Mesh.OptimizeNetgen = 1;
+Mesh.Smoothing = 100;
