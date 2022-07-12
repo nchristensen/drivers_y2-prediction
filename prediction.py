@@ -838,7 +838,11 @@ def main(ctx_factory=cl.create_some_context,
     h2.addFilter(f2)
     logger.addHandler(h2)
 
-    cl_ctx = ctx_factory()
+    platforms = cl.get_platforms()
+    cl_ctx = cl.Context(
+        dev_type=cl.device_type.GPU,
+        properties=[(cl.context_properties.PLATFORM, platforms[0])])
+    #cl_ctx = ctx_factory()
 
     from mpi4py import MPI
     comm = MPI.COMM_WORLD
@@ -2631,6 +2635,8 @@ if __name__ == "__main__":
                         help="enable lazy evaluation [OFF]")
     parser.add_argument("--overintegration", action="store_true",
         help="use overintegration in the RHS computations")
+    parser.add_argument("--autotune", action="store_true", default=False,
+                        help="enable autotuning [OFF]")
 
     args = parser.parse_args()
 
@@ -2648,6 +2654,23 @@ if __name__ == "__main__":
 
     from grudge.array_context import get_reasonable_array_context_class
     actx_class = get_reasonable_array_context_class(lazy=lazy, distributed=True)
+
+    if not args.autotune:
+        actx_class = get_reasonable_array_context_class(lazy=lazy, distributed=True)
+    else:
+        #from grudge.grudge_array_context import GrudgeArrayContext as actx_class
+        #from grudge.grudge_array_context import ParameterFixingPyOpenCLArrayContext as actx_class
+        #from grudge.grudge_array_context import KernelSavingArrayContext as actx_class
+        #from grudge.grudge_array_context import KernelSavingAutotuningArrayContext as actx_class
+        #from mirgecom.array_context import MirgecomAutotuningArrayContext as actx_class
+        #from mirgecom.array_context import MPIKernelSavingFusionContractorArrayContext as actx_class
+        #from grudge.array_context import MPIFusionContractorArrayContext as actx_class
+        #from grudge.grudge_array_context import COrderedKernelSavingArrayContext as actx_class
+        #from grudge.grudge_array_context import COrderedGrudgeArrayContext as actx_class
+        #from grudge.grudge_array_context import COrderedAutotuningArrayContext as actx_class
+        from mirgecom.array_context import MirgecomKernelSavingAutotuningArrayContext as actx_class
+        #from mirgecom.array_context import COrderedMirgecomKernelSavingAutotuningArrayContext as actx_class
+
 
     restart_filename = None
     if args.restart_file:
