@@ -33,6 +33,7 @@ import pyopencl.array as cla  # noqa
 import math
 from pytools.obj_array import make_obj_array
 from functools import partial
+from time import time
 
 from meshmode.mesh import BTAG_ALL, BTAG_NONE  # noqa
 from meshmode.dof_array import DOFArray
@@ -816,6 +817,8 @@ def main(ctx_factory=cl.create_some_context,
          use_profiling=False, use_logmgr=True, user_input_file=None,
          use_overintegration=False, actx_class=None, casename=None,
          lazy=False):
+
+    setup_start = time()
 
     if actx_class is None:
         raise RuntimeError("Array context class missing.")
@@ -2588,7 +2591,9 @@ def main(ctx_factory=cl.create_some_context,
         fluid_rhs = ns_rhs + chem_rhs + sponge_rhs + ignition_rhs
 
         return make_obj_array([fluid_rhs, wall_rhs, tseed_rhs])
-
+    
+    run_start = time()
+    setup_end = run_start
     current_step, current_t, stepper_state = \
         advance_state(rhs=my_rhs, timestepper=timestepper,
                       pre_step_callback=my_pre_step,
@@ -2599,6 +2604,10 @@ def main(ctx_factory=cl.create_some_context,
                       state=stepper_state)
     current_cv, current_wall_temperature, tseed = stepper_state
     current_fluid_state = create_fluid_state(current_cv, tseed)
+    run_end = time()
+
+    print("Setup time |", setup_end - setup_start, "| Run time |", run_end - run_start)
+
 
     # Dump the final data
     if rank == 0:
